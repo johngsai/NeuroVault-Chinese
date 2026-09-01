@@ -14,6 +14,9 @@
 //!   4. Known technology keywords (TECH_KEYWORDS) → `technology`
 //!   5. `Title Case Multi Word Phrases` → `person`
 //!   6. `"quoted phrases"` → `concept`
+//!   7. Chinese person names via jieba POS tagging (`nr`) → `person`
+//!      (2026-09: the Title-Case rule only fires on Latin text, so
+//!      Chinese names had no extraction path; jieba tags them `nr`.)
 //!
 //! Dedupe is case-insensitive on the name. Output capped at 30 to
 //! match Python's `entities[:30]` slice.
@@ -23,6 +26,7 @@ use regex::Regex;
 use rusqlite::Connection;
 use std::collections::HashSet;
 
+use super::cjk::{contains_cjk, JIEBA};
 use super::types::Result;
 
 /// Extracted entity to be stored via `store_entities`. `relations` is
@@ -219,6 +223,23 @@ pub fn extract_entities_locally(content: &str) -> Vec<ExtractedEntity> {
         }
     }
 
+    // 7. Chinese person names via jieba POS tagging (`nr`).
+    //
+    // The Title-Case rule above needs Latin capitalisation and never
+    // fires for Chinese, so Chinese names had no extraction path. jieba
+    // tags person names `nr` (HMM mode catches OOV names). Require
+    // ≥2 chars — jieba sometimes emits a bare surname ("王") or a
+    // single given-name char that would add noise as a "person".
+    // Runs only when the text actually contains CJK, keeping the
+    // pure-English ingest path unchanged.
+    if contains_cjk(content) {
+        for tag in JIEBA.tag(content, true) {
+            if tag.tag == "nr" && tag.word.chars().count() >= 2 {
+                add(tag.word, "person", &mut entities, &mut seen);
+            }
+        }
+    }
+
     entities.truncate(30);
     entities
 }
@@ -365,6 +386,40 @@ mod tests {
             ents.iter()
                 .any(|e| e.entity_type == "technology" && e.name == "Python"),
             "expected the source-cased `Python`, got {:?}",
+            ents.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn extracts_chinese_person_names_via_jieba() {
+        // A Chinese name with no Latin casing signal must still be
+        // extracted as a person — the Title-Case rule can't fire here.
+        let ents = extract_entities_locally("张伟今天去了北京，他和王磊讨论了项目。");
+        assert!(
+            ents.iter()
+                .any(|e| e.entity_type == "person" && e.name == "张伟"),
+            "expected 张伟 as a person, got {:?}",
+            ents.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            ents.iter()
+                .any(|e| e.entity_type == "person" && e.name == "王磊"),
+            "expected 王磊 as a person, got {:?}",
+            ents.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn pure_english_still_uses_title_case_person_path() {
+        // Regression guard: English extraction must be unchanged — the
+        // Title-Case rule needs a contiguous multi-word title-cased
+        // phrase (the existing TITLECASE_RE semantics), and the jieba
+        // pass must not add junk to pure-English text.
+        let ents = extract_entities_locally("Alice Smith met Bob Jones at the office.");
+        assert!(
+            ents.iter()
+                .any(|e| e.entity_type == "person" && e.name == "Alice Smith"),
+            "expected Alice Smith as a person, got {:?}",
             ents.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
         );
     }
