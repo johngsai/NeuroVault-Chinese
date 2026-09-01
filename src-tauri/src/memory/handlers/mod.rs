@@ -1112,7 +1112,7 @@ pub async fn brains_reset(
 
             // 3. Recreate vec_chunks fresh, with the exact same
             //    schema `db::ensure_vec_chunks` would create for a
-            //    new brain. Hardcoding the embedding dim here (384)
+            //    new brain. Hardcoding the embedding dim here
             //    rather than re-importing `EMBEDDING_DIM` would
             //    break the day someone bumps the model; pull from
             //    the constant.
@@ -3150,7 +3150,7 @@ pub async fn recall(
 // rises above one that only matches a single phrasing strongly.
 //
 // Why this lives in the server, not the agent: paraphrase mismatch
-// is a fundamental retrieval problem (BGE has a 384-dim vec; "tops"
+// is a fundamental retrieval problem (BGE has a 512-dim vec; "tops"
 // and "shirts" can land far apart even though they're semantically
 // equivalent). The agent already pays for the LLM tokens to phrase
 // alternatives; the server provides the "merge multiple retrieval
@@ -4605,7 +4605,7 @@ pub async fn list_images(
 // vector store with the new model.
 //
 // Cost: roughly the same as the original ingest of every engram —
-// 5-10 ms per chunk on the BGE-small-en-v1.5 path. A 500-engram
+// 5-10 ms per chunk on the BGE-small-zh-v1.5 path. A 500-engram
 // brain with ~3 chunks each ≈ 7-15 seconds wall-clock.
 //
 // Idempotent under a stable model: encoding the same text twice

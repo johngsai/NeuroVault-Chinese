@@ -41,7 +41,8 @@ use super::{migrations, sqlite_vec};
 /// match `config.py::EMBEDDING_DIM`. Hard-coded here rather than read
 /// from env — if this changes, both runtimes need to agree at compile
 /// time on the shape of every stored vector.
-pub const EMBEDDING_DIM: usize = 384;
+/// `bge-small-zh-v1.5` is 512-dim (the en-v1.5 was 384).
+pub const EMBEDDING_DIM: usize = 512;
 
 /// Embedded schema, included at compile time. `include_str!` pulls the
 /// file as a `&'static str` so we can pass it to `execute_batch`

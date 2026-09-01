@@ -1096,7 +1096,7 @@ fn cmd_longmemeval(args: &[String]) -> i32 {
                 "recency_ablated": !keep_recency,
                 "title_boosts_ablated": title_boosts_ablated,
                 "extra_ablate": extra_ablate,
-                "embedder": "BGE-small-en-v1.5 (fastembed, local ONNX)",
+                "embedder": "BGE-small-zh-v1.5 (fastembed, local ONNX)",
             },
             "means": means,
             "abstention": abstention_json,

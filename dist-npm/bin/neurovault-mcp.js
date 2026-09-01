@@ -78,10 +78,10 @@ if (process.platform !== 'win32') {
 // this from its home dir) and tell the user about the one-time first-run
 // download — on STDERR, so the MCP channel stays clean.
 const cacheDir = path.join(os.homedir(), '.neurovault', '.fastembed_cache');
-const modelDir = path.join(cacheDir, 'models--Xenova--bge-small-en-v1.5');
+const modelDir = path.join(cacheDir, 'models--Xenova--bge-small-zh-v1.5');
 if (!fs.existsSync(modelDir)) {
   process.stderr.write(
-    'NeuroVault: first recall downloads the on-device embedding model (~130 MB) ' +
+    'NeuroVault: first recall downloads the on-device embedding model (~90 MB) ' +
       'to ~/.neurovault/.fastembed_cache. This happens once.\n',
   );
 }

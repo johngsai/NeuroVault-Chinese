@@ -1,10 +1,10 @@
 //! Local text embedding via fastembed-rs.
 //!
-//! Port of `server/neurovault_server/embeddings.py`. Same model
-//! (`BAAI/bge-small-en-v1.5`), same 384 dims, same on-disk ONNX cache
-//! under `~/.neurovault/.fastembed_cache/`. Existing Python installs have the
-//! weights already downloaded; Rust picks them up on first `encode()`
-//! with no extra download.
+//! Port of `server/neurovault_server/embeddings.py`. Model is
+//! `BAAI/bge-small-zh-v1.5` (512-dim, Chinese+English), cached under
+//! `~/.neurovault/.fastembed_cache/`. Switched from the en-v1.5 on
+//! 2026-09 to fix Chinese retrieval (the en model's English-only
+//! tokenizer could not segment CJK text).
 //!
 //! Singleton by design — the ONNX session is ~30 MB resident and we
 //! only want one copy regardless of how many brains are active. Lazy
@@ -25,13 +25,14 @@ use super::paths::nv_home;
 use super::types::{MemoryError, Result};
 
 /// Max entries in the encode_query LRU. Matches `_QUERY_CACHE_MAX` in
-/// the Python embedder. 1000 × 384 × 4 bytes ≈ 1.5 MB of float data,
+/// the Python embedder. 1000 × 512 × 4 bytes ≈ 2 MB of float data,
 /// well under the memory budget for the hot path.
 const QUERY_CACHE_MAX: usize = 1000;
 
 /// Dimension the current model emits. Asserted at first encode so a
 /// silent upstream model swap doesn't corrupt the vec0 table.
-pub const EMBEDDING_DIM: usize = 384;
+/// `bge-small-zh-v1.5` is 512-dim (the en-v1.5 was 384).
+pub const EMBEDDING_DIM: usize = 512;
 
 // NOTE: We tried adding the BGE-en query prefix
 // ("Represent this sentence for searching relevant passages: ") in
@@ -297,7 +298,8 @@ const EMBEDDER_INIT_WAIT: std::time::Duration = std::time::Duration::from_secs(6
 
 fn build_embedder() -> Result<Embedder> {
     // `InitOptions::new` + explicit model id matches what the
-    // Python side passes: "BAAI/bge-small-en-v1.5".
+    // Python side passes: "BAAI/bge-small-zh-v1.5" (512-dim,
+    // Chinese+English — replaces the en-v1.5).
     //
     // Cache dir: fastembed-rs defaults to a CWD-RELATIVE
     // `.fastembed_cache`. That silently breaks a GUI app launched
@@ -307,7 +309,7 @@ fn build_embedder() -> Result<Embedder> {
     // dir under the data root so the model resolves no matter where
     // the app was launched from. An explicit FASTEMBED_CACHE_DIR env
     // still wins (fastembed reads it when we don't override).
-    let mut opts = InitOptions::new(EmbeddingModel::BGESmallENV15);
+    let mut opts = InitOptions::new(EmbeddingModel::BGESmallZHV15);
     if std::env::var_os("FASTEMBED_CACHE_DIR").is_none() {
         opts = opts.with_cache_dir(nv_home().join(".fastembed_cache"));
     }
@@ -368,8 +370,8 @@ pub fn encode(text: &str) -> Result<Vec<f32>> {
 /// markdown file chunks to ~115 docs; letting that run as a single
 /// batch was observed to spike RAM to 7+ GB on an 8 GB box.
 ///
-/// 32 is comfortable: peak tensor budget ≈ 32 × 512 × 384 × 4 bytes
-/// ≈ 25 MB per inference, times ~3 for intermediates ≈ 75 MB. Safe
+/// 32 is comfortable: peak tensor budget ≈ 32 × 512 × 512 × 4 bytes
+/// ≈ 34 MB per inference, times ~3 for intermediates ≈ 100 MB. Safe
 /// on any consumer machine. Throughput loss vs bigger batches is
 /// negligible because the model is CPU-bound and tiny.
 const MAX_BATCH: usize = 32;
@@ -455,7 +457,7 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn encode_returns_384_dim_vector() {
+    fn encode_returns_expected_dim_vector() {
         let v = encode("hello world").unwrap();
         assert_eq!(v.len(), EMBEDDING_DIM);
     }
