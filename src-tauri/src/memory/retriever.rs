@@ -743,10 +743,13 @@ fn title_embeddings(titles: &[String]) -> Result<Vec<Vec<f32>>> {
     Ok(out.into_iter().flatten().collect())
 }
 
-// ---- BM25 token helpers (mirror of memory::bm25 tokenise) -----------------
+// ---- BM25 token helpers (delegated to memory::bm25) ------------------------
+//
+// `bm25_tokenize` is now a thin wrapper over `bm25::tokenize`, which is
+// language-aware: CJK text goes through jieba, everything else through
+// the original Python-identical ASCII tokeniser. Keeping a single
+// implementation here avoids the two mirror copies drifting apart.
 
-static MD_PUNCT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[#*`\[\](){}|>~_]").unwrap());
-static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[a-z0-9]+(?:-[a-z0-9]+)*").unwrap());
 static BM25_STOPWORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     [
         "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
@@ -782,13 +785,7 @@ fn light_stem(t: &str) -> String {
 }
 
 fn bm25_tokenize(text: &str) -> Vec<String> {
-    let lower = text.to_lowercase();
-    let cleaned = MD_PUNCT_RE.replace_all(&lower, " ");
-    TOKEN_RE
-        .find_iter(&cleaned)
-        .map(|m| m.as_str().to_string())
-        .filter(|w| !BM25_STOPWORDS.contains(w.as_str()) && w.chars().count() > 1)
-        .collect()
+    bm25::tokenize(text)
 }
 
 // ---- Improvement #2: salient query terms (proper nouns / phrases) --------

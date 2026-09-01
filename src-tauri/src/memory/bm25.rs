@@ -22,6 +22,7 @@ use once_cell::sync::{Lazy, OnceCell};
 use parking_lot::{Mutex, RwLock};
 use regex::Regex;
 
+use super::cjk::{contains_cjk, JIEBA};
 use super::db::BrainDb;
 use super::types::Result;
 
@@ -65,9 +66,53 @@ static MD_PUNCT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[#*`\[\](){}|>~_]").
 /// `sqlite-vec`, `rank-bm25`, etc.). Matches Python exactly.
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[a-z0-9]+(?:-[a-z0-9]+)*").unwrap());
 
-/// Tokenise a single string the way Python does. Returns lowercase
-/// tokens with stopwords + 1-char tokens dropped.
-fn tokenize(text: &str) -> Vec<String> {
+/// Shared jieba instance + CJK detection live in `super::cjk` so the
+/// BM25 index and the entity extractor reuse one embedded dictionary.
+
+/// Common Chinese function words dropped from the BM25 index. The
+/// English stopword set above is language-specific; jieba segments
+/// prose into real words, but "的/了/是/我" etc. would dominate term
+/// frequency and dilute IDF if indexed. Kept as a compact literal set —
+/// jieba-rs's own `DEFAULT_STOP_WORDS` is only exported behind the
+/// `tfidf`/`textrank` features we deliberately don't enable.
+static CJK_STOPWORDS: Lazy<std::collections::HashSet<&'static str>> = Lazy::new(|| {
+    [
+        "的", "了", "是", "在", "和", "与", "及", "或", "而", "但", "就", "都", "很", "也", "又",
+        "还", "被", "把", "让", "向", "从", "为", "以", "于", "之", "其", "这", "那", "个", "中",
+        "上", "下", "有", "没", "不", "我", "你", "他", "她", "它", "我们", "你们", "他们", "她们",
+        "它们", "自己", "这个", "那个", "这些", "那些", "什么", "怎么", "为什么", "如何", "这样",
+        "那样", "一个", "一些", "有的", "可以", "应该", "要", "会", "能", "到", "对", "比", "使",
+        "用", "以及", "因此", "所以", "因为", "但是", "不过", "然后", "而且", "如果", "虽然", "着",
+        "过", "呢", "吗", "吧", "啊", "呀", "嘛", "哦", "噢", "哈", "嗯",
+        // High-frequency adverbs / particles that jieba segments as
+        // their own token but carry no retrieval value.
+        "真的", "非常", "特别", "比较", "已经", "还是", "还有", "可能", "大概", "也许", "就是",
+        "只是", "挺", "有点", "一起", "一直", "一定",
+    ]
+    .iter()
+    .copied()
+    .collect()
+});
+
+/// Tokenise a single string the way Python does, extended for Chinese.
+///
+/// If the text contains CJK characters it is segmented with jieba
+/// (Chinese words — including single-character content words like "书"
+/// — survive; function words are dropped via `CJK_STOPWORDS`). Pure
+/// ASCII/Latin text takes the original Python-identical path: lowercase
+/// tokens with stopwords + 1-char tokens dropped. The English path is
+/// byte-for-byte unchanged so no existing benchmark regresses.
+pub fn tokenize(text: &str) -> Vec<String> {
+    if contains_cjk(text) {
+        tokenize_cjk(text)
+    } else {
+        tokenize_latin(text)
+    }
+}
+
+/// The original Python-identical tokeniser (lowercase + alphanum runs,
+/// stopwords + 1-char dropped). Used verbatim for non-CJK text.
+fn tokenize_latin(text: &str) -> Vec<String> {
     let lower = text.to_lowercase();
     let cleaned = MD_PUNCT_RE.replace_all(&lower, " ");
     TOKEN_RE
@@ -75,6 +120,40 @@ fn tokenize(text: &str) -> Vec<String> {
         .map(|m| m.as_str().to_string())
         .filter(|w| !STOPWORDS.contains(w.as_str()) && w.chars().count() > 1)
         .collect()
+}
+
+/// jieba segmentation for CJK-bearing text.
+///
+/// Markdown punctuation is swept first (same `MD_PUNCT_RE` as the
+/// Latin path) so `#`, backticks and brackets don't leak into words.
+/// Each jieba token is kept if it is a Chinese content word (single
+/// characters like "书"/"狗" are real search terms, so they survive
+/// where the Latin path's `>1` filter would drop them) or an ASCII
+/// token that passes the Latin filter. Chinese function words are
+/// dropped via `CJK_STOPWORDS`.
+fn tokenize_cjk(text: &str) -> Vec<String> {
+    let cleaned = MD_PUNCT_RE.replace_all(text, " ");
+    let mut out: Vec<String> = Vec::new();
+    for tok in JIEBA.cut(&cleaned, true) {
+        let w = tok.word;
+        if w.is_empty() {
+            continue;
+        }
+        if contains_cjk(w) {
+            if !CJK_STOPWORDS.contains(w) {
+                out.push(w.to_string());
+            }
+        } else {
+            // ASCII token inside a CJK sentence (e.g. `fastembed` in
+            // "用 fastembed 嵌入"): apply the Latin filter so casing and
+            // stopwords behave the same as the pure-English path.
+            let lower = w.to_lowercase();
+            if !STOPWORDS.contains(lower.as_str()) && lower.chars().count() > 1 {
+                out.push(lower);
+            }
+        }
+    }
+    out
 }
 
 /// The inner index state. Swapped wholesale on rebuild so concurrent
@@ -358,6 +437,47 @@ mod tests {
         assert!(out.contains(&"code".to_string()));
         assert!(!out.contains(&"the".to_string()));
         assert!(!out.contains(&"over".to_string()));
+    }
+
+    #[test]
+    fn chinese_text_produces_words() {
+        // Pure-Chinese text: the old ASCII tokeniser returned zero
+        // tokens (so Chinese notes never entered the BM25 index); jieba
+        // must segment it into searchable words. jieba's dictionary
+        // prefers multi-character compounds ("北京烤鸭" is one token),
+        // so assert on the tokens it actually emits.
+        let out = tokenize("北京烤鸭真的很好吃");
+        eprintln!("DEBUG tokens: {:?}", out);
+        assert!(!out.is_empty(), "CJK text must tokenize to words");
+        assert!(out.contains(&"北京烤鸭".to_string()), "got {:?}", out);
+        assert!(out.contains(&"好吃".to_string()), "got {:?}", out);
+        // High-frequency adverb is dropped as a stopword.
+        assert!(!out.contains(&"真的".to_string()), "got {:?}", out);
+    }
+
+    #[test]
+    fn chinese_single_char_content_words_survive() {
+        // Single-character content words ("狗", "猫") are real search
+        // terms in Chinese and must survive the tokenizer — unlike the
+        // Latin path's `chars().count() > 1` filter. jieba segments
+        // them as their own tokens here (no multi-char compound wins).
+        let out = tokenize("狗和猫");
+        eprintln!("DEBUG tokens: {:?}", out);
+        assert!(out.contains(&"狗".to_string()), "got {:?}", out);
+        assert!(out.contains(&"猫".to_string()), "got {:?}", out);
+        // The conjunction 和 is dropped.
+        assert!(!out.contains(&"和".to_string()), "got {:?}", out);
+    }
+
+    #[test]
+    fn mixed_chinese_latin_text_tokenizes_both() {
+        // CJK routes through jieba; embedded ASCII still gets the Latin
+        // treatment (lowercased, stopword-filtered).
+        let out = tokenize("用 fastembed 嵌入中文 The quick");
+        assert!(out.contains(&"fastembed".to_string()));
+        assert!(out.contains(&"嵌入".to_string()));
+        assert!(out.contains(&"中文".to_string()));
+        assert!(!out.contains(&"the".to_string()));
     }
 
     #[test]

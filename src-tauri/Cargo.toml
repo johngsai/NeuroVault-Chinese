@@ -154,6 +154,16 @@ thiserror = "1"
 # cross-language output tests Phase 3 requires pass without adjustment.
 regex = "1"
 
+# Chinese word segmentation (jieba-rs). The BM25 keyword branch's
+# tokenizer was ASCII-only ([a-z0-9]+), which produced zero tokens for
+# CJK text — pure-Chinese notes never entered the keyword index. jieba
+# segments Han text into words so the hybrid retriever's keyword arm
+# works for Chinese. The default dictionary is embedded in the binary
+# (`default-dict` feature) — zero runtime downloads, fully local.
+# We do NOT enable `tfidf`/`textrank` (keyword-extraction extras) —
+# only `Jieba::cut` / `Jieba::tag` are used.
+jieba-rs = "0.10"
+
 # UAX#29 text segmentation. The curator's SEG_V1 prose pass
 # (`memory/adaptive/curator/segment.rs`) uses
 # `split_sentence_bound_indices()` so sentence boundaries are a pure
