@@ -44,7 +44,7 @@
 
 ## 🔌 连接 AI 客户端（MCP）
 
-NeuroVault 自带本地 MCP 服务（`neurovault-server --mcp-only`）。**使用前请先启动 NeuroVault 应用**，客户端会通过它把请求转发到本地服务（`127.0.0.1:8765`）。
+NeuroVault 自带本地 MCP 服务（`neurovault-server --mcp-only`），**无需手动启动 App**：首次调用时若检测到本地没有正在运行的服务，它会自动在后台拉起一个无界面的记忆引擎（headless）并转发到本地 `127.0.0.1:8765`；若你开着 NeuroVault App（想用图形界面），则自动连到 App 自带的那个服务。启动日志在 `~/.neurovault/autostart.log`，可用环境变量 `NEUROVAULT_AUTOSTART=0` 关闭自动启动。
 
 > 路径说明：以下为 macOS 默认安装路径。App 不在 `/Applications` 时换成实际路径；Windows 上是 `neurovault-server.exe` 的完整路径。
 
@@ -75,9 +75,9 @@ NeuroVault 自带本地 MCP 服务（`neurovault-server --mcp-only`）。**使�
 }
 ```
 
-### DSHarness（DeepSeek Harness）—— `~/.dsh/profiles/desktop/cordis.patch.yml`
+### DSHarness（DeepSeek Harness）
 
-追加到 patch 层的 `insert` 列表（若文件还是空的 `# []`，直接把整段 `- insert:` 放进去）：
+把下面的 `insert` 追加到**当前 profile** 的 `cordis.patch.yml`（桌面版一般是 `~/.dsh/profiles/desktop/cordis.patch.yml`，web 版是 `~/.dsh/profiles/web/…`，profile 名不同就换成实际的；文件还是空的 `# []` 时，直接把整段 `- insert:` 放进去）：
 
 ```yaml
 - insert:
