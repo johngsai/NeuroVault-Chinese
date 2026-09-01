@@ -1331,8 +1331,11 @@ pub async fn query_signal(
         let id = resolve_brain_id(q.brain_id.as_deref())?;
         let db = open_brain(&id)?;
         let idx = super::bm25::index_for(&id);
-        if idx.size() == 0 {
-            idx.build(&db)?;
+        if idx.needs_rebuild() {
+            // Same freshness contract as the recall path: refresh
+            // synchronously so the ambient signal never reads a
+            // stale index that predates the newest ingest.
+            idx.flush(&db)?;
         }
         let (n, stats) = idx.query_signal(&q.q);
         let nf = n as f64;

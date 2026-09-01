@@ -2775,8 +2775,15 @@ fn round4(x: f64) -> f64 {
 /// rebuilds from the write path keep it up-to-date.
 fn ensure_bm25_built(db: &BrainDb) -> Result<std::sync::Arc<Bm25Index>> {
     let idx = bm25::index_for(db.brain_id());
-    if idx.size() == 0 {
-        idx.build(db)?;
+    if idx.needs_rebuild() {
+        // Synchronous refresh when the index is empty OR a debounced
+        // rebuild is pending: the keyword channel must see a note the
+        // instant it is saved. The old `size() == 0`-only check left a
+        // 5-second window after every ingest where freshly-written notes
+        // were invisible to keyword search — which is how just-created
+        // Chinese notes (found via the keyword channel) could seem to
+        // vanish while the semantic-only "北京烤鸭" still matched.
+        idx.flush(db)?;
     }
     Ok(idx)
 }
@@ -3774,5 +3781,212 @@ mod degraded_channel_tests {
         assert!(!resolve_rerank(RerankPref::Unset, "natural"));
         assert!(resolve_rerank(RerankPref::On, "natural"));
         assert!(!resolve_rerank(RerankPref::Off, "keyword"));
+    }
+
+    /// Documents the Chinese-search channel split behind the user report:
+    /// short Chinese terms (北京 / 张伟 / 王磊) are found RELIABLY by the
+    /// keyword (BM25) channel — jieba segments them as exact doc tokens —
+    /// while "北京烤鸭" is a jieba compound that has NO exact token in the
+    /// doc (jieba cuts it as 北京 + 烤鸭店), so ONLY the semantic channel
+    /// can ever surface it. When the BM25 index is stale (the 5s debounce
+    /// after an ingest) or its results are cut by the recall throttle, the
+    /// keyword-dependent terms vanish while "北京烤鸭" survives via
+    /// semantic. Runs the degraded pipeline (dead embedder → semantic down)
+    /// so it needs no ONNX model.
+    #[test]
+    fn chinese_entity_components_are_found_by_keyword_but_compounds_are_not() {
+        let _lock = LATCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "nv-cjk-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let brain = db::open_file(&path).expect("open test brain");
+        const NOTES: [(&str, &str, &str, &str); 5] = [
+            (
+                "e-zhang",
+                "ce-shi-cai-liao.md",
+                "测试材料",
+                "张伟昨天在北京烤鸭店讨论了 Rust 项目",
+            ),
+            (
+                "e-wang",
+                "untitled.md",
+                "测试用例",
+                "王磊对 MCP 协议很感兴趣",
+            ),
+            (
+                "e-vec",
+                "vector-db.md",
+                "Storage decision",
+                "We chose sqlite-vec over Chroma for the embedding store.",
+            ),
+            (
+                "e-yoga",
+                "yoga.md",
+                "Health",
+                "Yoga classes happen on Camden High Street on Mondays.",
+            ),
+            (
+                "e-coffee",
+                "espresso.md",
+                "Coffee",
+                "I pull a 1:2 ratio espresso from Ethiopian beans every morning.",
+            ),
+        ];
+        {
+            let conn = brain.lock();
+            for (id, filename, title, body) in NOTES {
+                conn.execute(
+                    "INSERT INTO engrams (id, filename, title, content, content_hash, kind,
+                                          state, strength, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?1, 'note', 'fresh', 1.0,
+                             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                    rusqlite::params![id, filename, title, body],
+                )
+                .expect("seed engram");
+                conn.execute(
+                    "INSERT INTO chunks (id, engram_id, content, granularity, chunk_index)
+                     VALUES (?1 || '-c', ?1, ?2, 'paragraph', 0)",
+                    rusqlite::params![id, body],
+                )
+                .expect("seed chunk");
+            }
+        }
+        bm25::drop_index(brain.brain_id());
+
+        let _dead = embedder::DeadModelGuard::new();
+        let search = |q: &str| -> Vec<String> {
+            let opts = RecallOpts {
+                top_k: 5,
+                ablate: vec!["recency".to_string()],
+                ..RecallOpts::default()
+            };
+            let (hits, _status) = hybrid_retrieve_with_status(&brain, q, &opts)
+                .unwrap_or_else(|e| panic!("recall failed for {q:?}: {e}"));
+            hits.into_iter().map(|h| h.engram_id).collect()
+        };
+
+        // Keyword channel finds the exact-token terms…
+        for (q, want) in [("北京", "e-zhang"), ("张伟", "e-zhang"), ("王磊", "e-wang")] {
+            let ids = search(q);
+            assert!(
+                ids.iter().any(|id| id == want),
+                "query {q:?} should surface {want} via BM25, got {ids:?}"
+            );
+        }
+        // …but the jieba compound "北京烤鸭" has no exact doc token, so the
+        // keyword channel alone cannot find it — this is why it can only
+        // ever arrive via the (model-dependent) semantic channel.
+        assert!(
+            !search("北京烤鸭").contains(&"e-zhang".to_string()),
+            "北京烤鸭 has no exact BM25 token — keyword alone must not claim it"
+        );
+
+        drop(_dead);
+        bm25::drop_index(brain.brain_id());
+        drop(brain);
+        note_semantic_available();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The keyword channel must see a note the instant it is saved, not only
+    /// after the 5s debounced rebuild. Reproduces the stale-window bug behind
+    /// the "just-created Chinese note won't search" report: the old
+    /// `size()==0`-only freshness check left every note invisible to BM25 for
+    /// the debounce window, and short Chinese queries (which rely on the
+    /// keyword channel) lost them entirely.
+    #[test]
+    fn a_recall_within_the_bm25_debounce_window_sees_new_notes() {
+        let _lock = LATCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "nv-bm25-stale-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let brain = std::sync::Arc::new(db::open_file(&path).expect("open test brain"));
+
+        // Seed a few notes + chunks (≥4 so BM25 IDF is non-zero — the N=2
+        // corpus zeroes every score), then warm the index.
+        {
+            let conn = brain.lock();
+            for (id, filename, title, body) in [
+                ("e-old", "old.md", "Old", "The carrot crop failed this year."),
+                ("e-vec", "vector-db.md", "Storage decision", "We chose sqlite-vec over Chroma for the embedding store."),
+                ("e-yoga", "yoga.md", "Health", "Yoga classes happen on Camden High Street on Mondays."),
+                ("e-coffee", "espresso.md", "Coffee", "I pull a 1:2 ratio espresso from Ethiopian beans every morning."),
+            ] {
+                conn.execute(
+                    "INSERT INTO engrams (id, filename, title, content, content_hash, kind,
+                                          state, strength, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?1, 'note', 'fresh', 1.0,
+                             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                    rusqlite::params![id, filename, title, body],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO chunks (id, engram_id, content, granularity, chunk_index)
+                     VALUES (?1 || '-c', ?1, ?2, 'paragraph', 0)",
+                    rusqlite::params![id, body],
+                )
+                .unwrap();
+            }
+        }
+        {
+            let idx = bm25::index_for(brain.brain_id());
+            idx.flush(&brain).expect("warm the index");
+        }
+
+        // A second note is now ingested: rows committed, but the debounced
+        // rebuild is still pending inside its 5s window.
+        {
+            let conn = brain.lock();
+            conn.execute(
+                "INSERT INTO engrams (id, filename, title, content, content_hash, kind,
+                                      state, strength, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?1, 'note', 'fresh', 1.0,
+                         '2026-01-01T00:00:01Z', '2026-01-01T00:00:01Z')",
+                rusqlite::params!["e-new", "new.md", "New", "A turnip the size of a cantaloupe rolled past the shed."],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks (id, engram_id, content, granularity, chunk_index)
+                 VALUES (?1 || '-c', ?1, ?2, 'paragraph', 0)",
+                rusqlite::params!["e-new", "A turnip the size of a cantaloupe rolled past the shed."],
+            )
+            .unwrap();
+        }
+        // The ingest path marks the index dirty and schedules the debounce.
+        {
+            let idx = bm25::index_for(brain.brain_id());
+            idx.schedule_rebuild(std::sync::Arc::clone(&brain));
+            assert!(
+                idx.needs_rebuild(),
+                "a pending debounce must mark the index dirty"
+            );
+        }
+
+        let _dead = embedder::DeadModelGuard::new();
+        let opts = RecallOpts {
+            top_k: 5,
+            ablate: vec!["recency".to_string()],
+            ..RecallOpts::default()
+        };
+        // Query by a token unique to the just-created note: it must be found
+        // immediately — the recall path refreshes the stale index
+        // synchronously instead of serving pre-ingest tokens.
+        let (hits, _status) = hybrid_retrieve_with_status(&brain, "turnip", &opts)
+            .expect("recall must not fail on a dirty index");
+        assert!(
+            hits.iter().any(|h| h.engram_id == "e-new"),
+            "a note saved moments ago must be keyword-searchable immediately, got {:?}",
+            hits.iter().map(|h| &h.engram_id).collect::<Vec<_>>()
+        );
+
+        drop(_dead);
+        bm25::drop_index(brain.brain_id());
+        drop(brain);
+        note_semantic_available();
+        let _ = std::fs::remove_file(&path);
     }
 }

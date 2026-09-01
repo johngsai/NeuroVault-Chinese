@@ -18,6 +18,13 @@ import { toast } from "./toastStore";
 export type SaveStatus = "saved" | "dirty" | "saving" | "failed";
 export type NotesStatus = "idle" | "loading" | "ready" | "error";
 
+/// Debounce for the sidebar's semantic ranking call. The local title/filename
+/// filter (Sidebar.tsx) re-runs instantly on `searchQuery`, so only the
+/// /api/recall fetch waits — a typing burst collapses to one request. Matches
+/// the command palette's RECALL_DEBOUNCE_MS so all human surfaces behave the
+/// same against the shared per-brain 60s recall throttle.
+const SEARCH_DEBOUNCE_MS = 220;
+
 interface NoteStore {
   brainId: string | null;
   notes: NoteMeta[];
@@ -68,6 +75,9 @@ export const useNoteStore = create<NoteStore>((set, get) => {
   // list/recall request must not repopulate state after a brain switch.
   const notesLoadGate = new LatestRequestGate();
   const searchGate = new LatestRequestGate();
+  // Pending sidebar-recall timer, cleared on every keystroke so a burst
+  // schedules exactly one fetch (for the final query).
+  let searchDebounce: ReturnType<typeof setTimeout> | null = null;
   const draftPersistence = new NoteDraftPersistence(localStorage);
   installNoteDraftLifecycleFlush(draftPersistence);
 
@@ -498,19 +508,29 @@ export const useNoteStore = create<NoteStore>((set, get) => {
       if (!query || query.trim().length < 2) return;
 
       const q = query.trim();
-      void (async () => {
-        try {
-          const response = await fetch(
-            `${API_HOST}/api/recall?q=${encodeURIComponent(q)}&mode=titles&limit=50`,
-          );
-          if (!response.ok) return;
-          const hits = (await response.json()) as Array<{ engram_id: string; filename: string }>;
-          if (!searchGate.isCurrent(generation)) return;
-          set({ searchResults: hits.map((hit) => hit.filename).filter(Boolean) });
-        } catch {
-          // Server offline — cleared results leave the local title fallback.
-        }
-      })();
+      // Debounce the fetch: the sidebar's local title filter already re-ran
+      // synchronously above, so delaying the /api/recall ranking by a beat
+      // loses nothing for the user. Without this, each keystroke fired a
+      // request — a 17-char query burned 17 calls against the per-brain 60s
+      // recall throttle and surfaced the agent-facing "hard-throttled" hint
+      // in the command palette during normal human search.
+      if (searchDebounce !== null) clearTimeout(searchDebounce);
+      searchDebounce = setTimeout(() => {
+        searchDebounce = null;
+        void (async () => {
+          try {
+            const response = await fetch(
+              `${API_HOST}/api/recall?q=${encodeURIComponent(q)}&mode=titles&limit=50`,
+            );
+            if (!response.ok) return;
+            const hits = (await response.json()) as Array<{ engram_id: string; filename: string }>;
+            if (!searchGate.isCurrent(generation)) return;
+            set({ searchResults: hits.map((hit) => hit.filename).filter(Boolean) });
+          } catch {
+            // Server offline — cleared results leave the local title fallback.
+          }
+        })();
+      }, SEARCH_DEBOUNCE_MS);
     },
   };
 });

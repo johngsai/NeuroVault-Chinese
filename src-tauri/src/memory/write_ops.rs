@@ -335,16 +335,27 @@ pub fn create_note(ctx: &BrainContext, title: &str) -> Result<WriteResult> {
 /// for audit; chunks + vec embeddings are dropped so recall no
 /// longer surfaces the note.
 pub fn delete_note(ctx: &BrainContext, filename: &str) -> Result<WriteResult> {
-    let engram_id = ingest::lookup_engram_by_filename(&ctx.db, filename)?
-        .ok_or_else(|| MemoryError::EngramNotFound(filename.to_string()))?;
+    let engram_id = ingest::lookup_engram_by_filename(&ctx.db, filename)?;
+
+    // A note on disk is deletable even when the index has no row for it:
+    // the DB is a rebuildable index over the vault, so a markdown file
+    // present on disk but not yet indexed — the seeded welcome note, or a
+    // file dropped in by an external editor before the watcher caught it —
+    // must still move to trash. Only when BOTH the file and the engram are
+    // absent is there genuinely nothing to delete.
+    let src = ctx.vault.join(filename);
+    if engram_id.is_none() && !src.exists() {
+        return Err(MemoryError::EngramNotFound(filename.to_string()));
+    }
 
     // DB-first: if the file move fails, the row goes back via a
     // future ingest when the user restores the file. If we moved
     // the file first and then the DB update crashed, we'd have a
     // dormant file on disk with a live DB row — harder to recover.
-    ingest::soft_delete_engram(&ctx.db, &engram_id)?;
+    if let Some(id) = &engram_id {
+        ingest::soft_delete_engram(&ctx.db, id)?;
+    }
 
-    let src = ctx.vault.join(filename);
     if src.exists() {
         let trash_dir = trash_dir(ctx);
         std::fs::create_dir_all(&trash_dir)?;
@@ -376,7 +387,7 @@ pub fn delete_note(ctx: &BrainContext, filename: &str) -> Result<WriteResult> {
     }
 
     Ok(WriteResult {
-        engram_id,
+        engram_id: engram_id.unwrap_or_default(),
         filename: filename.to_string(),
         brain_id: ctx.brain_id.clone(),
         status: "deleted".to_string(),
@@ -493,5 +504,111 @@ mod trash_tests {
             trash_metadata_path(note),
             PathBuf::from("/tmp/trash/example.md.neurovault-trash.json")
         );
+    }
+
+    #[test]
+    fn delete_moves_file_to_trash_even_when_engram_row_is_missing() {
+        // Reproduces the "Welcome to NeuroVault" delete failure: the note is
+        // seeded on disk but never ingested (the watcher only reacts to
+        // create/modify events, so a pre-existing file has no engram row).
+        // The sidebar (filesystem-based list) still shows it, but delete_note
+        // used to demand a DB row and died with "engram not found: welcome.md".
+        let tmp = std::env::temp_dir().join(format!("nv-delete-welcome-{}", uuid::Uuid::new_v4()));
+        let vault = tmp.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("welcome.md"), "# Welcome to NeuroVault\n").unwrap();
+        let db = super::super::db::open_file(&tmp.join("brain.db")).unwrap();
+        let ctx = BrainContext {
+            brain_id: "test".to_string(),
+            db: Arc::new(db),
+            vault: vault.clone(),
+        };
+
+        // Precondition: file on disk, no engram row — exactly the state the
+        // seeded welcome note lands in.
+        assert!(
+            ingest::lookup_engram_by_filename(&ctx.db, "welcome.md")
+                .unwrap()
+                .is_none()
+        );
+
+        let res = delete_note(&ctx, "welcome.md").unwrap();
+        assert_eq!(res.status, "deleted");
+
+        // File moved to trash, original gone from the vault.
+        assert!(!vault.join("welcome.md").exists());
+        assert!(trash_dir(&ctx).join("welcome.md").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn delete_with_neither_file_nor_engram_still_errors() {
+        // The EngramNotFound contract is preserved: when there is genuinely
+        // nothing to delete — no file on disk AND no index row — the caller
+        // must still hear "not found" rather than a silent success.
+        let tmp = std::env::temp_dir().join(format!("nv-delete-missing-{}", uuid::Uuid::new_v4()));
+        let vault = tmp.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let db = super::super::db::open_file(&tmp.join("brain.db")).unwrap();
+        let ctx = BrainContext {
+            brain_id: "test".to_string(),
+            db: Arc::new(db),
+            vault: vault.clone(),
+        };
+
+        let err = delete_note(&ctx, "never-existed.md").unwrap_err();
+        assert!(
+            err.to_string().contains("engram not found"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn delete_with_file_and_engram_present_soft_deletes_row_and_moves_file() {
+        // The original happy path is untouched by the fix: when the index
+        // does have a row, delete soft-deletes it (state -> dormant) AND
+        // moves the markdown to trash.
+        let tmp = std::env::temp_dir().join(format!("nv-delete-both-{}", uuid::Uuid::new_v4()));
+        let vault = tmp.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("welcome.md"), "# Welcome to NeuroVault\n").unwrap();
+        let db = super::super::db::open_file(&tmp.join("brain.db")).unwrap();
+        let ctx = BrainContext {
+            brain_id: "test".to_string(),
+            db: Arc::new(db),
+            vault: vault.clone(),
+        };
+        // Seed a matching index row the way ingest would.
+        {
+            let conn = ctx.db.lock();
+            conn.execute(
+                "INSERT INTO engrams (id, filename, title, content, content_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params!["e-welcome", "welcome.md", "Welcome to NeuroVault", "# Welcome", "hash"],
+            )
+            .unwrap();
+        }
+
+        let res = delete_note(&ctx, "welcome.md").unwrap();
+        assert_eq!(res.engram_id, "e-welcome");
+
+        // File moved to trash; index row flipped to dormant.
+        assert!(!vault.join("welcome.md").exists());
+        assert!(trash_dir(&ctx).join("welcome.md").exists());
+        let state: String = {
+            let conn = ctx.db.lock();
+            conn.query_row(
+                "SELECT state FROM engrams WHERE id = ?1",
+                ["e-welcome"],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(state, "dormant");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

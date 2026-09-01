@@ -13,7 +13,7 @@
 //! rebuild on brain A doesn't cancel brain B's pending rebuild.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -174,6 +174,13 @@ struct Inner {
 /// generation counter — each `schedule_rebuild` bumps it; the
 /// detached timer thread only fires if its captured generation still
 /// matches at wake-up time.
+///
+/// A `dirty` flag bridges the debounce window: the moment `schedule_rebuild`
+/// is called (right after an ingest) the index is marked dirty, so a recall
+/// inside the 5s debounce refreshes synchronously instead of serving tokens
+/// that predate the newest note. Without this, a note was invisible to the
+/// keyword channel (and thus to short Chinese queries, which lean on it)
+/// until the debounced rebuild fired 5s later.
 pub struct Bm25Index {
     brain_id: String,
     inner: RwLock<Inner>,
@@ -181,6 +188,10 @@ pub struct Bm25Index {
     // the current value and no-ops if the captured value doesn't
     // equal the current one when it wakes up.
     epoch: AtomicU64,
+    // True while a debounced rebuild is pending (or while the index may
+    // be out of date vs the DB). Cleared only by a build that ran with
+    // no newer schedule in flight — so `needs_rebuild()` is exact.
+    dirty: AtomicBool,
     // Serialises concurrent `build()` calls against the DB so we don't
     // race two rebuild threads tokenising at once. Cheap because
     // rebuilds are rare (every 5s at most under observation-hook
@@ -194,6 +205,9 @@ impl Bm25Index {
             brain_id,
             inner: RwLock::new(Inner::default()),
             epoch: AtomicU64::new(0),
+            // A brand-new index has never built: treat it as dirty so the
+            // first `needs_rebuild()` forces a build.
+            dirty: AtomicBool::new(true),
             build_lock: Mutex::new(()),
         }
     }
@@ -221,6 +235,15 @@ impl Bm25Index {
 
     pub fn size(&self) -> usize {
         self.inner.read().n as usize
+    }
+
+    /// Whether the index may be out of date relative to the DB: either
+    /// nothing is built yet, or a debounced rebuild is pending because an
+    /// ingest happened after the last build. Callers that are about to
+    /// search should refresh synchronously when this is true so the
+    /// keyword channel never serves tokens that predate the newest note.
+    pub fn needs_rebuild(&self) -> bool {
+        self.size() == 0 || self.dirty.load(Ordering::Acquire)
     }
 
     /// Rebuild the index from the database. Blocks on the build_lock
@@ -288,11 +311,17 @@ impl Bm25Index {
     /// Schedule a debounced rebuild. Returns immediately — actual
     /// rebuild happens on a detached thread after `DEBOUNCE_SECS`,
     /// unless another `schedule_rebuild` lands first (which resets
-    /// the timer).
+    /// the timer) or a caller refreshes synchronously via `flush`
+    /// (which cancels the pending thread via the epoch bump).
+    ///
+    /// Also marks the index dirty immediately, so a recall inside the
+    /// debounce window sees `needs_rebuild() == true` and refreshes
+    /// synchronously rather than serving pre-ingest tokens.
     ///
     /// The db handle is cloned via `Arc` so the timer thread can hold
     /// it without keeping the caller's reference alive.
     pub fn schedule_rebuild(self: &Arc<Self>, db: Arc<BrainDb>) {
+        self.dirty.store(true, Ordering::Release);
         let my_epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         let this = Arc::clone(self);
         thread::Builder::new()
@@ -309,18 +338,30 @@ impl Bm25Index {
                         "[neurovault] BM25 debounced rebuild failed for brain {}: {}",
                         this.brain_id, e
                     );
+                } else if this.epoch.load(Ordering::Acquire) == my_epoch {
+                    // No newer schedule landed while we built; the index
+                    // is current again.
+                    this.dirty.store(false, Ordering::Release);
                 }
             })
             .ok();
     }
 
-    /// Run any pending rebuild synchronously now. Used by tests +
-    /// graceful-shutdown to avoid racing a detached thread against
-    /// teardown.
+    /// Run any pending rebuild synchronously now. Used by tests,
+    /// graceful-shutdown, and the recall path when `needs_rebuild()` —
+    /// refreshing here means a just-saved note is keyword-searchable
+    /// immediately, not 5 seconds later.
     pub fn flush(&self, db: &BrainDb) -> Result<()> {
         // Bump epoch so any already-scheduled thread no-ops on wake.
         self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.build(db)
+        let my_epoch = self.epoch.load(Ordering::Acquire);
+        self.build(db)?;
+        // If a schedule_rebuild landed while we were building, keep the
+        // index dirty — the newer data isn't in yet.
+        if self.epoch.load(Ordering::Acquire) == my_epoch {
+            self.dirty.store(false, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Query the index. Returns `(chunk_id, score)` pairs sorted
