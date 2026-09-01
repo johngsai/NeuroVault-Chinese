@@ -37,10 +37,60 @@
 
 1. **启动**：打开 NeuroVault，先创建/选择一个记忆库（Brain）。所有数据都在本地 `~/.neurovault/`，笔记就是普通 `.md` 文件，随时可导出或备份。
 2. **记录**：在「Memories」里直接写笔记，或让接入的 AI 帮你写；把文件拖进窗口可导入。
-3. **接入 AI（MCP，核心用法）**：App 内 **Settings → Connections** 一键配置 Claude Code / Claude Desktop / Cursor 等客户端，之后它们就能跨会话回忆你的记忆。
+3. **接入 AI（MCP，核心用法）**：App 内 **Settings → Connections** 可一键配置；或手动配置 Kilo Code / Pi / DSHarness 等客户端（见下方「连接 AI 客户端」）。之后它们就能跨会话回忆你的记忆。
 4. **浏览与回忆**：「Today」看最近动态，「Graph」看记忆之间的关联图谱，搜索框检索历史记忆。
 
 > 完整图文教程见上游文档：[neurovault.dathproject.com/docs](https://neurovault.dathproject.com/docs)
+
+## 🔌 连接 AI 客户端（MCP）
+
+NeuroVault 自带本地 MCP 服务（`neurovault-server --mcp-only`）。**使用前请先启动 NeuroVault 应用**，客户端会通过它把请求转发到本地服务（`127.0.0.1:8765`）。
+
+> 路径说明：以下为 macOS 默认安装路径。App 不在 `/Applications` 时换成实际路径；Windows 上是 `neurovault-server.exe` 的完整路径。
+
+### Kilo Code —— `~/.config/kilo/kilo.jsonc`
+
+在文件**顶层**加入（若已有 `"mcp"` 键，把 `neurovault` 并进去），保存后重启 Kilo Code：
+
+```jsonc
+"mcp": {
+  "neurovault": {
+    "type": "local",
+    "command": ["/Applications/NeuroVault.app/Contents/MacOS/neurovault-server", "--mcp-only"],
+    "enabled": true
+  }
+}
+```
+
+### Pi —— `~/.config/mcp/mcp.json`
+
+```json
+{
+  "mcpServers": {
+    "neurovault": {
+      "command": "/Applications/NeuroVault.app/Contents/MacOS/neurovault-server",
+      "args": ["--mcp-only"]
+    }
+  }
+}
+```
+
+### DSHarness（DeepSeek Harness）—— `~/.dsh/profiles/desktop/cordis.patch.yml`
+
+追加到 patch 层的 `insert` 列表（若文件还是空的 `# []`，直接把整段 `- insert:` 放进去）：
+
+```yaml
+- insert:
+    - id: mcp-neurovault
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: neurovault
+        transport: stdio
+        command: /Applications/NeuroVault.app/Contents/MacOS/neurovault-server
+        args: ['--mcp-only']
+```
+
+> Claude Code / Cursor / Claude Desktop 等其他客户端使用标准 `mcpServers` 格式，配置方法见上游文档。
 
 ## 🔧 从源码构建
 
