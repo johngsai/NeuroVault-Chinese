@@ -1,0 +1,90 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-mac/
+src-tauri/target/
+test-results/
+playwright-report/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sidecar binaries — staged at build time by scripts/stage-sidecar.mjs
+# (per-target neurovault-server[.exe]); never committed.
+src-tauri/binaries/
+
+# Tauri-generated ACL/capability schemas — regenerated on every build from
+# tauri.conf.json + capabilities/*.json. Kept on disk for the local build,
+# never tracked (they churn on any capability change).
+src-tauri/gen/
+
+# Python server
+server/__pycache__/
+server/.venv/
+server/*.egg-info/
+server/dist/
+server/build/
+*.pyc
+
+# Tauri release bundles (installers are built locally and uploaded to GH releases)
+src-tauri/target/
+src-tauri/WixTools/
+
+# Demo-video build artifacts (Remotion renders, hundreds of MB)
+demo-video/out/
+demo-video/.remotion/
+
+# Eval run logs (keep baselines under eval/baselines/, ignore ad-hoc run logs)
+eval/*.log
+
+# Python caches that slip in under subdirs
+**/__pycache__/
+**/*.pyc
+
+# ONNX model cache — auto-downloaded by fastembed-rs on first run
+.fastembed_cache/
+
+# LongMemEval datasets — large (~280 MB), re-downloadable, not committed
+bench/longmemeval/data/*.json
+
+# Ad-hoc server / bench run logs (cruft; graded_*.jsonl evidence stays tracked)
+server-*.log
+server-*.err
+bench/**/*.log
+bench/**/*.log.err
+bench/**/server_*.log*
+
+# build logs + scratch screenshots/scripts
+build_*.txt
+/_*.png
+/_*.mjs
+
+# demo-video: separate Remotion project, not part of the app repo
+# (kept locally, untracked).
+demo-video/
+
+# Local benchmarking scratch — not part of the app.
+bench/
+
+# Orchestration scratch state (model-supermaxxing runs)
+.supermax/
+
+# Benchmark scratch: chunked-run partials and per-chunk scratch dirs.
+# Cited evidence files (results + A/B logs) are tracked explicitly.
+docs/benchmarks/chunks*/
+docs/benchmarks/*.partial.jsonl
+docs/benchmarks/longmemeval-production-A-partial.json
+.sentrux/

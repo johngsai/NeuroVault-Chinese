@@ -1,0 +1,14 @@
+{
+  "identifier": "default",
+  "description": "Capabilities for the main application window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:app:allow-set-app-theme",
+    "shell:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "updater:default",
+    "process:allow-restart"
+  ]
+}

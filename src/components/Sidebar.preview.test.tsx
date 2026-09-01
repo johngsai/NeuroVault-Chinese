@@ -1,0 +1,102 @@
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mocks = vi.hoisted(() => ({
+  readNote: vi.fn<(filename: string, brainId?: string | null) => Promise<string>>(),
+  virtualIndexes: [0, 1, 2] as number[],
+}));
+
+vi.mock("@tanstack/react-virtual", () => ({
+  useVirtualizer: ({ count }: { count: number }) => ({
+    getVirtualItems: () => mocks.virtualIndexes
+      .filter((index) => index < count)
+      .map((index) => ({ index, key: `row-${index}`, start: index * 68 })),
+    getTotalSize: () => count * 68,
+    measureElement: () => undefined,
+  }),
+}));
+
+vi.mock("../lib/tauri", () => ({
+  createNote: vi.fn(),
+  deleteNote: vi.fn(),
+  getVaultPath: vi.fn(),
+  listNotes: vi.fn().mockResolvedValue([]),
+  readNote: mocks.readNote,
+  saveNote: vi.fn(),
+}));
+
+import { useBrainStore } from "../stores/brainStore";
+import { useNoteStore } from "../stores/noteStore";
+import { useSettingsStore } from "../stores/settingsStore";
+import { Sidebar } from "./Sidebar";
+
+const notes = Array.from({ length: 40 }, (_, index) => ({
+  filename: `note-${index}.md`,
+  title: `Note ${index}`,
+  modified: index,
+  size: 100,
+}));
+
+function prepare(showPreviewSnippets: boolean): void {
+  mocks.readNote.mockImplementation(async (filename) => `# ${filename}\n\nPreview`);
+  useBrainStore.setState({
+    activeBrainId: "alpha",
+    activeBrainName: "Alpha",
+    brains: [],
+    loading: false,
+  });
+  useNoteStore.setState({
+    brainId: "alpha",
+    notes,
+    notesStatus: "ready",
+    notesError: null,
+    activeFilename: null,
+    vaultPath: "/vaults/alpha",
+    searchQuery: "",
+    searchResults: [],
+  });
+  useSettingsStore.setState({ showPreviewSnippets });
+}
+
+describe("Sidebar preview loading", () => {
+  beforeEach(() => {
+    mocks.readNote.mockReset();
+    mocks.virtualIndexes = [0, 1, 2];
+  });
+
+  it("reads only virtualized visible and overscan note rows, not the full vault", async () => {
+    prepare(true);
+    render(<Sidebar />);
+
+    await waitFor(() => expect(mocks.readNote).toHaveBeenCalledTimes(3));
+    expect(mocks.readNote.mock.calls.map(([filename]) => filename)).toEqual([
+      "note-0.md",
+      "note-1.md",
+      "note-2.md",
+    ]);
+    expect(mocks.readNote.mock.calls.map(([, brainId]) => brainId)).toEqual(["alpha", "alpha", "alpha"]);
+  });
+
+  it("performs zero preview reads when snippets are disabled", async () => {
+    prepare(false);
+    render(<Sidebar />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(mocks.readNote).not.toHaveBeenCalled();
+  });
+
+  it("keeps Trash beside New note without duplicate vault or Settings controls", () => {
+    prepare(false);
+    const onTrashOpen = vi.fn();
+    render(<Sidebar onTrashOpen={onTrashOpen} />);
+
+    const trash = screen.getByRole("button", { name: "Open Trash" });
+    const newNote = screen.getByTitle("New note (Ctrl+N)");
+    expect(trash.parentElement).toBe(newNote.parentElement);
+    expect(screen.queryByTitle("Settings")).not.toBeInTheDocument();
+    expect(screen.queryByText("Alpha")).not.toBeInTheDocument();
+
+    fireEvent.click(trash);
+    expect(onTrashOpen).toHaveBeenCalledOnce();
+  });
+});

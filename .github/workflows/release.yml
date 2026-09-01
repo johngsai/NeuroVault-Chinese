@@ -1,0 +1,526 @@
+#  Cross-platform release builds for NeuroVault.
+#
+#  Triggered by pushing a tag matching `v*` (e.g. `git tag v0.1.2 &&
+#  git push --tags`) or manually via the Actions tab. Builds Windows +
+#  macOS (Apple Silicon) + Linux in parallel and uploads the resulting
+#  installers to a draft GitHub Release.
+#
+#  Why a draft (not auto-publish): release notes get a human pass and we
+#  spot a broken artifact before users grab it. Edit + publish from the
+#  Releases UI when the matrix finishes green.
+#
+#  macOS signing/notarization is enabled when the Apple secrets documented
+#  in docs/MACOS-RELEASE.md are present; without them the mac draft is an
+#  unsigned test artifact and must not be published.
+#
+#  Windows artifacts are NOT Authenticode-signed — there is no Windows
+#  certificate in this pipeline, so SmartScreen reports an unknown publisher.
+#  That is a known, documented gap (README says so plainly); do not let the
+#  wording above imply otherwise.
+#
+#  Reproducibility note: sqlite-vec is pinned below. Bump it deliberately,
+#  never by resolving a floating "latest" release during a build.
+#
+#  Replaces the pre-v0.1.0 workflow that built a Python sidecar via
+#  PyInstaller. Sidecar was retired in the Rust migration; advanced
+#  the MCP server is the same native Rust binary; nothing spawns Python.
+
+name: Release
+
+on:
+  push:
+    tags:
+      # `v[0-9]*` matches semver tags like v0.1.5 / v1.0.0 but not
+      # the VS Code extension's `vscode-v*` tags, which have their own
+      # release-vscode.yml pipeline.
+      - "v[0-9]*"
+  workflow_dispatch:
+    # Manual trigger for testing the workflow without a real tag.
+    # Uses the most recent commit on whatever branch is selected.
+
+jobs:
+  build:
+    name: Build (${{ matrix.os-label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            os-label: windows
+            rust-target: x86_64-pc-windows-msvc
+            vec_os: windows
+            vec_arch: x86_64
+            vec_sha256: 51581189d52066b4dfc6631f6d7a3eab7dedc2260656ab09ca97ab3fb8165983
+            # Upstream sqlite-vec only ships windows builds as tar.gz (no
+            # zip variant). Git Bash on the Windows runner has tar built
+            # in, so the else-branch of the extract step handles it the
+            # same way as macOS / Linux.
+            vec_archive_ext: tar.gz
+          - os: macos-14   # Apple Silicon (M-series)
+            os-label: macos-arm64
+            rust-target: aarch64-apple-darwin
+            vec_os: macos
+            vec_arch: aarch64
+            vec_sha256: 8282126333399ddfe98bbbcc7a1936e7252625aac49df056a98be602e46bfd29
+            vec_archive_ext: tar.gz
+          # NOTE: no Intel-Mac (macos-13 / x86_64) job, and building from
+          # source does NOT work as a fallback — the only vec0 we ship is
+          # arm64, and it is dlopen'd on every brain open, so an x86_64 build
+          # gets a library it cannot load. Two things are needed before Intel
+          # can come back: a reliable Intel runner (the v0.5.0 job sat ~24h in
+          # the queue and produced nothing) AND an x86_64/universal vec0.
+          - os: ubuntu-22.04   # 22.04 has webkit2gtk-4.1; 24.04 phased it out
+            os-label: linux-x64
+            rust-target: x86_64-unknown-linux-gnu
+            vec_os: linux
+            vec_arch: x86_64
+            vec_sha256: b959baa1d8dc88861b1edb337b8587178cdcb12d60b4998f9d10b6a82052d5d7
+            vec_archive_ext: tar.gz
+    runs-on: ${{ matrix.os }}
+    # Bound a stuck job so it can't hang the run for hours.
+    #
+    # Raised 60 -> 150 after v0.6.0's first attempt died at exactly 60.2
+    # minutes. The build itself was fine (~19 min); the job was killed
+    # mid-`notarytool`, 41 minutes into waiting on Apple, and the cleanup
+    # log shows "Terminate orphan process: (notarytool)".
+    #
+    # 60 was generous for a BUILD and far too tight for this pipeline. The
+    # Apple secrets landed after v0.5.2, so no release had ever notarized
+    # before — the wait was invisible until it wasn't. Apple's notary is a
+    # queue with no SLA; single submissions can take well over 30 minutes,
+    # and this job now makes TWO (tauri notarizes the .app, then the DMG is
+    # notarized and stapled separately).
+    #
+    # Raised again 150 -> 330 for v0.6.0's second attempt, which was still
+    # inside tauri's .app notarization at 126 minutes. Apple's status page
+    # reported the notary itself operational but App Store Connect and its
+    # API had both had incidents that day — notarization runs on that
+    # infrastructure, so submissions were sitting behind a backlog.
+    #
+    # The ceiling exists to catch a HANG, not to bound Apple's queue. 330
+    # is under GitHub's 360 hard cap and costs nothing on a normal day,
+    # when the whole job finishes in ~25 minutes.
+    timeout-minutes: 330
+    permissions:
+      contents: write   # creates / updates GitHub Releases
+      actions: read     # lets the SBOM action attach its release asset
+      id-token: write   # Sigstore certificate for build provenance
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # --- Linux system deps -------------------------------------------------
+      # Tauri's canonical apt list. webkit2gtk = embedded webview;
+      # libayatana-appindicator = system tray; librsvg2 = SVG icon
+      # rendering; patchelf is needed by the AppImage bundler.
+      - name: Install Linux deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            patchelf
+
+      # --- Toolchains --------------------------------------------------------
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      # Cache cargo's target dir per platform. The release profile uses
+      # lto=fat + codegen-units=1, so a cold build is 4-6 minutes.
+      # With this cache, incremental rebuilds drop to ~90s.
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.rust-target }}
+
+      # --- vec0 binary -------------------------------------------------------
+      # The sqlite-vec extension we load at runtime. Different filename
+      # per platform: vec0.dll / vec0.dylib / vec0.so. tauri.conf.json
+      # uses a glob (resources/vec0.*) so whichever file is present at
+      # build time gets bundled into the installer. We resolve "latest"
+      # from the upstream releases API so this workflow doesn't rot when
+      # a new sqlite-vec ships.
+      - name: Download sqlite-vec extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/resources
+
+          # Pinned, NOT resolved from the API. Resolving "latest" via the
+          # unauthenticated GitHub API rate-limits on shared macOS-runner
+          # IPs (60 req/hr/IP); the rate-limit body has no `tag_name`, so
+          # the pipeline failed instantly and broke the mac build (v0.3.0
+          # + v0.3.1). Pinning also makes builds reproducible. Bump this
+          # deliberately when adopting a new sqlite-vec.
+          VERSION="v0.1.9"
+          echo "Using sqlite-vec ${VERSION}"
+
+          # Asset name pattern: sqlite-vec-{ver}-loadable-{os}-{arch}.{ext}
+          # ver in the asset is the tag without the leading 'v'.
+          STRIPPED="${VERSION#v}"
+          ASSET="sqlite-vec-${STRIPPED}-loadable-${{ matrix.vec_os }}-${{ matrix.vec_arch }}.${{ matrix.vec_archive_ext }}"
+          URL="https://github.com/asg017/sqlite-vec/releases/download/${VERSION}/${ASSET}"
+          echo "Fetching ${URL}"
+          curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o /tmp/vec0-archive "${URL}"
+
+          # Verify BEFORE extracting. This binary is dlopen'd into our process
+          # on every brain open, so an unverified download is arbitrary code
+          # execution inside a signed, notarized app. The hashes are pinned per
+          # platform in the matrix and were recorded from the pinned v0.1.9
+          # release; the macOS one is byte-identical to the vec0.dylib
+          # committed in src-tauri/resources, which cross-checks both.
+          EXPECTED="${{ matrix.vec_sha256 }}"
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::no vec_sha256 pinned for this platform"
+            exit 1
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            ACTUAL=$(sha256sum /tmp/vec0-archive | awk '{print $1}')
+          else
+            ACTUAL=$(shasum -a 256 /tmp/vec0-archive | awk '{print $1}')
+          fi
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::sqlite-vec checksum mismatch for ${ASSET}"
+            echo "  expected $EXPECTED"
+            echo "  actual   $ACTUAL"
+            exit 1
+          fi
+          echo "sqlite-vec checksum verified: $ACTUAL"
+
+          # Extract just the vec0 binary into src-tauri/resources/.
+          # Both .tar.gz and .zip ship the file at the archive root.
+          if [ "${{ matrix.vec_archive_ext }}" = "zip" ]; then
+            unzip -o /tmp/vec0-archive -d src-tauri/resources/
+          else
+            tar -xzf /tmp/vec0-archive -C src-tauri/resources/
+          fi
+          ls -lh src-tauri/resources/
+
+      # --- Sign vec0.dylib (macOS only) --------------------------------------
+      # MUST run before `tauri build`, and is not optional on a signed build.
+      # Two independent failures happen without it:
+      #
+      #   1. Notarization is rejected. Apple's notary requires every nested
+      #      Mach-O in the bundle to carry a Developer ID signature with
+      #      hardened runtime. vec0.dylib arrives from the sqlite-vec release
+      #      adhoc-signed (TeamIdentifier=not set).
+      #   2. Even if accepted, the app would be BROKEN. Tauri enables hardened
+      #      runtime by default and signs the outer bundle WITHOUT `--deep`
+      #      (`copy_resources` never adds resources to sign_paths). Library
+      #      validation then refuses to dlopen a dylib not signed by our Team
+      #      ID, sqlite3_load_extension fails, and per sqlite_vec.rs "every
+      #      brain-DB open fails".
+      #
+      # Signing with OUR identity is the right fix rather than granting
+      # `com.apple.security.cs.disable-library-validation`: a same-team dylib
+      # passes validation, so we keep the protection instead of disabling it.
+      #
+      # This has never run before — the APPLE_* secrets landed after v0.5.2,
+      # so every previous mac build was unsigned and hardened runtime was off.
+      # Skipped when the cert secret is absent (fork PRs), matching the guard
+      # the verify step already uses.
+      - name: Sign vec0.dylib for hardened runtime
+        if: matrix.os-label == 'macos-arm64'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          DYLIB="src-tauri/resources/vec0.dylib"
+          if [ ! -f "$DYLIB" ]; then
+            echo "::error::$DYLIB missing — the download step did not produce it"
+            exit 1
+          fi
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            echo "::warning::No APPLE_CERTIFICATE — leaving vec0.dylib adhoc-signed."
+            echo "This build is a DEVELOPMENT artifact: it cannot be notarized, and"
+            echo "under hardened runtime it would fail to open any brain DB."
+            exit 0
+          fi
+
+          # Import the cert into a temporary keychain. tauri-action does the
+          # same for its own signing, but it runs later — an identity is
+          # needed NOW, before the bundle is sealed.
+          KEYCHAIN="$RUNNER_TEMP/vec0-signing.keychain-db"
+          KEYCHAIN_PWD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PWD" "$KEYCHAIN" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          codesign --force --timestamp --options runtime \
+            --sign "$APPLE_SIGNING_IDENTITY" "$DYLIB"
+
+          # Assert the OUTCOME rather than trusting the exit code: an adhoc
+          # signature also exits 0, and shipping one is the entire failure.
+          codesign -dv --verbose=2 "$DYLIB" 2>&1 | tee /tmp/vec0-sig.txt
+          if grep -q "Signature=adhoc" /tmp/vec0-sig.txt; then
+            echo "::error::vec0.dylib is still adhoc-signed after codesign"
+            exit 1
+          fi
+          if ! grep -q "TeamIdentifier=" /tmp/vec0-sig.txt; then
+            echo "::error::vec0.dylib has no TeamIdentifier — library validation will reject it"
+            exit 1
+          fi
+          codesign --verify --strict "$DYLIB"
+          echo "vec0.dylib signed and verified for hardened runtime"
+
+      # --- Frontend ----------------------------------------------------------
+      - name: Install npm deps
+        run: npm ci
+
+      # --- Release notes from CHANGELOG.md ----------------------------------
+      # Pulls the section under `## [<version>]` for the current tag so
+      # the release body matches the changelog without hand-copying.
+      # Falls back to a generic message if the section isn't there yet.
+      - name: Extract CHANGELOG section for this tag
+        id: changelog
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          body=""
+          if [ -f CHANGELOG.md ]; then
+            body=$(awk -v ver="$VERSION" '
+              $0 ~ "^## \\[" ver "\\]" { flag=1; next }
+              flag && /^## \[/ { flag=0 }
+              flag { print }
+            ' CHANGELOG.md)
+          fi
+          if [ -z "$body" ]; then
+            body="See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for the full release notes."
+          fi
+          {
+            echo "body<<CHANGELOG_EOF"
+            echo "$body"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # --- Tauri build + draft release --------------------------------------
+      # tauri-action runs `npx tauri build --target <rust-target>`,
+      # picks up each platform's bundle output (.exe, .dmg, .deb,
+      # .AppImage), creates / updates a single draft Release for the tag,
+      # and attaches every matrix job's artifacts to it.
+      - name: Build + upload to draft release
+        uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4 # v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing. With these present `tauri build` emits a `.sig`
+          # next to each updater artifact and tauri-action rolls every
+          # platform into a single `latest.json` (includeUpdaterJson below),
+          # which the in-app updater fetches to verify + install updates.
+          # Keys live only in repo secrets — see docs/UPDATER-SETUP.md.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Developer ID signing + Apple notarization. Empty secrets leave
+          # non-macOS jobs unchanged; the macOS draft must stay unpublished
+          # until scripts/verify-macos-release.sh passes.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          # `--config src-tauri/updater-ci.conf.json` turns on
+          # createUpdaterArtifacts for the CI build ONLY (merged via the CLI
+          # --config flag — the bundler ignores the TAURI_CONFIG env var). We
+          # deliberately keep createUpdaterArtifacts OUT of the committed
+          # tauri.conf.json: with a pubkey set, enabling it makes a *local*
+          # keyless `tauri build` fail. So CI signs; local builds stay simple.
+          args: --target ${{ matrix.rust-target }} --config src-tauri/updater-ci.conf.json
+          tagName: ${{ github.ref_name }}
+          includeUpdaterJson: true
+          releaseName: "NeuroVault ${{ github.ref_name }}"
+          releaseBody: |
+            ## NeuroVault ${{ github.ref_name }}
+
+            ${{ steps.changelog.outputs.body }}
+
+            ---
+
+            ### Downloads
+
+            - **macOS (Apple Silicon, macOS 14+)**: `NeuroVault_*_aarch64.dmg`
+              — Developer ID signed and notarized
+            - **Windows x64**: `NeuroVault_*_x64-setup.exe` (NSIS) /
+              `*_x64_en-US.msi` — **not code-signed yet**, see below
+            - **Linux x64**: `neurovault_*_amd64.AppImage` / `*.deb` / `*.rpm`
+            - **macOS (Intel)**: not supported — the bundled `vec0` extension is
+              built arm64-only, so even a source build cannot open a brain
+
+            ### Verification status
+
+            macOS artifacts stay a draft until they pass the signing,
+            notarization, staple, checksum, and provenance checklist.
+
+            **Windows artifacts are not Authenticode-signed.** SmartScreen will
+            report an unknown publisher. That is expected for this release, not
+            a sign of tampering — verify the SHA-256 checksum and the Sigstore
+            provenance attestation instead. An Authenticode certificate is on
+            the roadmap.
+
+            **macOS 14 (Sonoma) is a hard floor.** The bundled sqlite-vec
+            extension is built for macOS 14+ and loads on every brain open, so
+            on macOS 11-13 the app starts but cannot open any database.
+
+            Full changelog: https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md
+          releaseDraft: true
+          prerelease: false
+
+      # --- MANDATORY macOS verification --------------------------------------
+      # Runs IMMEDIATELY after the build, before any optional Apple-queue wait.
+      #
+      # Ordering is load-bearing, not cosmetic. This used to sit *after* the
+      # best-effort DMG notarization, which waits up to 45 minutes on Apple.
+      # `continue-on-error` does NOT protect against a JOB-level timeout, so a
+      # slow queue could burn the remaining budget and have GitHub kill the job
+      # before these mandatory checks ever ran — turning the checks that decide
+      # whether the app WORKS into the ones most likely to be skipped.
+      #
+      # These are hard gates: Developer ID authority, notarized + stapled .app,
+      # Gatekeeper acceptance, and a Team-ID-signed vec0.dylib.
+      - name: Verify Developer ID signature and notarization
+        if: matrix.os-label == 'macos-arm64'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "Apple signing secrets are not configured; leaving release as an unsigned draft."
+            exit 0
+          fi
+          APP_PATH=$(find "src-tauri/target/${{ matrix.rust-target }}/release/bundle/macos" -maxdepth 1 -name '*.app' -print -quit)
+          DMG_PATH=$(find "src-tauri/target/${{ matrix.rust-target }}/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -print -quit)
+          bash scripts/verify-macos-release.sh "$APP_PATH" "$DMG_PATH"
+
+          # The whole point of the vec0 signing step is that the SHIPPED
+          # bundle contains a Team-ID-signed extension. Assert it on the real
+          # artifact — a passing `codesign --verify` on the outer bundle does
+          # NOT cover resources, which is exactly how this was missed.
+          VEC0="$APP_PATH/Contents/Resources/resources/vec0.dylib"
+          if [ ! -f "$VEC0" ]; then
+            echo "::error::vec0.dylib missing from the bundle — the app cannot open any brain DB"
+            exit 1
+          fi
+          codesign -dv --verbose=2 "$VEC0" 2>&1 | tee /tmp/vec0-bundled.txt
+          if grep -q "Signature=adhoc" /tmp/vec0-bundled.txt; then
+            echo "::error::bundled vec0.dylib is adhoc-signed — hardened runtime will refuse to load it"
+            exit 1
+          fi
+
+          # The bundled extension decides the app's real OS floor: it is
+          # dlopen'd on every brain open, so its minos IS the minimum macOS,
+          # regardless of what the app binary was built against. Assert the two
+          # agree, or we ship an app that launches and then cannot open a
+          # database (exactly the v0.6.0 pre-release finding).
+          DECLARED=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['bundle']['macOS']['minimumSystemVersion'])")
+          VEC_MINOS=$(xcrun vtool -show-build "$VEC0" 2>/dev/null | awk '/minos/{print $2; exit}')
+          echo "declared minimumSystemVersion=$DECLARED ; vec0.dylib minos=$VEC_MINOS"
+          if [ -n "$VEC_MINOS" ] && [ "$(printf '%s\n%s\n' "$VEC_MINOS" "$DECLARED" | sort -V | tail -1)" != "$DECLARED" ]; then
+            echo "::error::vec0.dylib requires macOS $VEC_MINOS but tauri.conf.json declares $DECLARED — users between those versions would install the app and then fail to open any brain."
+            exit 1
+          fi
+
+      # --- Notarize + staple the DMG (best-effort) ---------------------------
+      # tauri-bundler notarizes and staples the .app, then wraps it in a DMG it
+      # never notarizes — its dmg/mod.rs only *signs* (verified at CLI 2.10.1).
+      # Stapling the DMG is real hardening: Gatekeeper can then validate the
+      # download without calling Apple, so a first open works offline.
+      #
+      # BEST-EFFORT on purpose. Do not make this fatal again. It is a SECOND
+      # notary submission, and it is not what makes the app work — the .app
+      # inside already carries its own stapled ticket. v0.6.0 proved the cost:
+      # with Apple's queue backed up behind an App Store Connect incident, one
+      # submission ran over two hours. A hard-failing second submission lets
+      # Apple's queue depth block a release that is otherwise correct.
+      #
+      # CRITICAL: tauri-action already uploaded the DMG, so stapling the local
+      # file alone changes nothing for users — they would still download the
+      # pre-staple bytes, and the attestation below would cover a file that is
+      # not the published one. The re-upload is what makes this real.
+      - name: Notarize, staple, and re-upload the DMG (best-effort)
+        id: dmg_notarize
+        if: matrix.os-label == 'macos-arm64'
+        continue-on-error: true
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            echo "Apple signing secrets are not configured; skipping DMG notarization."
+            exit 0
+          fi
+          DMG_PATH=$(find "src-tauri/target/${{ matrix.rust-target }}/release/bundle/dmg" \
+            -maxdepth 1 -name '*.dmg' -print -quit)
+          if [ -z "$DMG_PATH" ]; then
+            echo "::error::no DMG produced by the build"
+            exit 1
+          fi
+          echo "Notarizing $DMG_PATH"
+          # Bounded so a backlogged queue costs 45 minutes, not the job.
+          if ! xcrun notarytool submit "$DMG_PATH" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" \
+                --wait --timeout 45m; then
+            echo "::warning::DMG notarization did not complete (Apple queue). The .app inside is notarized and stapled, so Gatekeeper still validates it offline; the DMG itself will require a network check on first open."
+            exit 1
+          fi
+          xcrun stapler staple "$DMG_PATH"
+          xcrun stapler validate "$DMG_PATH"
+
+          # Replace the asset tauri-action uploaded with the stapled bytes.
+          # Without this the staple is invisible to every user.
+          echo "Re-uploading stapled DMG to ${GITHUB_REF_NAME}"
+          gh release upload "${GITHUB_REF_NAME}" "$DMG_PATH" --clobber
+          echo "DMG notarized, stapled, and re-uploaded"
+
+      # Attestation runs LAST so it covers the final bytes — including the
+      # stapled DMG re-uploaded above. Attesting before that would sign a file
+      # users never receive.
+      #
+      # `.rpm` is included: tauri.conf.json uses targets "all", which produces
+      # one, and the README advertises it — but it was missing from these globs,
+      # so the published RPM shipped with no provenance.
+      - name: Attest installer provenance
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999 # v4
+        with:
+          subject-path: |
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/**/*.dmg
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/**/*.exe
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/**/*.msi
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/**/*.AppImage
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/**/*.deb
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/**/*.rpm
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: src-tauri/target/${{ matrix.rust-target }}/release/bundle
+          format: spdx-json
+          artifact-name: neurovault-${{ matrix.os-label }}.spdx.json
+          upload-release-assets: true

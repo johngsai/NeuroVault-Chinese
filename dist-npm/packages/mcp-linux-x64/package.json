@@ -1,0 +1,22 @@
+{
+  "name": "@neurovault/mcp-linux-x64",
+  "version": "0.6.0",
+  "description": "NeuroVault headless MCP server \u2014 prebuilt binary for Linux x64 (glibc).",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/neurovault-server",
+    "bin/vec0.so"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sirdath/NeuroVault.git",
+    "directory": "dist-npm/packages/mcp-linux-x64"
+  },
+  "homepage": "https://github.com/sirdath/NeuroVault#readme"
+}

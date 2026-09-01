@@ -1,0 +1,441 @@
+/* GraphFilterPanel — Obsidian-style slide-out panel for the graph
+ * view. Groups every graph-specific control (filters, display,
+ * forces, time-lapse) in one place so the main toolbar stays clean
+ * and the user can customise without leaving the canvas.
+ *
+ * The panel reads / writes the graph settings store. The graph view
+ * subscribes to the same store, so every change applies live with no
+ * apply / save step.
+ */
+
+import { useState } from "react";
+import { useGraphSettingsStore, PALETTES } from "../stores/graphSettingsStore";
+import type {
+  GraphPalette,
+  GraphMode,
+} from "../stores/graphSettingsStore";
+
+interface Props {
+  open: boolean;
+  onClose: () => void;
+  /** Total node count + isolated count, surfaced in the Filters
+   *  section so the user knows how many orphans are around without
+   *  having to count rings. */
+  nodeCount: number;
+  orphanCount: number;
+  semanticEdgeCount: number;
+  /** kind="code" nodes currently in the graph (a graphified repo).
+   *  0 hides the Code-layer toggle entirely. */
+  codeNodeCount: number;
+  /** Callbacks the parent owns because they touch the simulation
+   *  reference, not just store state. */
+  onTimelapseStart: () => void;
+  onTimelapseStop: () => void;
+  timelapseActive: boolean;
+}
+
+const PALETTE_LABELS: { value: GraphPalette; label: string; hint: string }[] = [
+  { value: "warm", label: "Warm", hint: "Peach + cools" },
+  { value: "cool", label: "Cool", hint: "Blue / teal" },
+  { value: "mono", label: "Mono", hint: "Single hue" },
+  { value: "vivid", label: "Vivid", hint: "Saturated" },
+];
+
+const GRAPHMODE_LABELS: { value: GraphMode; label: string; hint: string }[] = [
+  { value: "full", label: "Full", hint: "Every effect (default)" },
+  { value: "lite", label: "Lite", hint: "Low-power preset for large vaults" },
+  { value: "off", label: "Off", hint: "Disable the graph entirely" },
+];
+
+function Section({
+  title,
+  open,
+  setOpen,
+  children,
+}: {
+  title: string;
+  open: boolean;
+  setOpen: (v: boolean) => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      className="border-b"
+      style={{ borderColor: "var(--nv-border)" }}
+    >
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-full flex items-center gap-2 px-4 py-3 text-[12px] font-[Geist,sans-serif] font-medium uppercase tracking-wider transition-colors"
+        style={{ color: "var(--nv-text-muted)" }}
+      >
+        <span
+          className="inline-block transition-transform"
+          style={{ transform: open ? "rotate(90deg)" : "rotate(0deg)" }}
+        >
+          ▶
+        </span>
+        {title}
+      </button>
+      {open && <div className="px-4 pb-4 space-y-3">{children}</div>}
+    </div>
+  );
+}
+
+function Toggle({
+  label,
+  checked,
+  onChange,
+  hint,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  hint?: string;
+}) {
+  return (
+    <label
+      className="flex items-center justify-between gap-2 cursor-pointer select-none text-[12px] font-[Geist,sans-serif]"
+      style={{ color: "var(--nv-text)" }}
+      title={hint}
+    >
+      <span>{label}</span>
+      <span
+        onClick={() => onChange(!checked)}
+        className="relative inline-block w-9 h-5 rounded-full transition-colors flex-shrink-0"
+        style={{
+          background: checked ? "var(--nv-accent)" : "var(--nv-surface)",
+          border: "1px solid var(--nv-border)",
+        }}
+      >
+        <span
+          className="absolute top-[2px] w-3.5 h-3.5 rounded-full transition-transform"
+          style={{
+            left: checked ? "calc(100% - 1.05rem)" : "2px",
+            background: checked ? "var(--nv-bg)" : "var(--nv-text-muted)",
+          }}
+        />
+      </span>
+    </label>
+  );
+}
+
+function Slider({
+  label,
+  value,
+  min,
+  max,
+  step,
+  onChange,
+  formatter,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (v: number) => void;
+  formatter?: (v: number) => string;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <div
+        className="flex items-center justify-between text-[11px] font-[Geist,sans-serif]"
+        style={{ color: "var(--nv-text-muted)" }}
+      >
+        <span>{label}</span>
+        <span style={{ color: "var(--nv-text-dim)", fontVariantNumeric: "tabular-nums" }}>
+          {formatter ? formatter(value) : value.toFixed(2)}
+        </span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className="w-full accent-current cursor-pointer"
+        style={{ color: "var(--nv-accent)" }}
+      />
+    </div>
+  );
+}
+
+
+export function GraphFilterPanel({
+  open,
+  onClose,
+  nodeCount,
+  orphanCount,
+  semanticEdgeCount,
+  codeNodeCount,
+  onTimelapseStart,
+  onTimelapseStop,
+  timelapseActive,
+}: Props) {
+  const s = useGraphSettingsStore();
+  const [openSections, setOpenSections] = useState({
+    filters: true,
+    display: true,
+    forces: false,
+    appearance: false,
+    timelapse: true,
+  });
+
+  if (!open) return null;
+
+  const toggleSection = (k: keyof typeof openSections) =>
+    setOpenSections((prev) => ({ ...prev, [k]: !prev[k] }));
+
+
+  return (
+    <div
+      className="absolute top-4 right-4 bottom-4 w-72 z-30 rounded-xl overflow-hidden flex flex-col"
+      style={{
+        background: "var(--nv-bg)",
+        border: "1px solid var(--nv-border)",
+        boxShadow: "0 12px 40px rgba(0,0,0,0.4)",
+      }}
+    >
+      {/* Header */}
+      <div
+        className="flex items-center justify-between px-4 py-3 border-b flex-shrink-0"
+        style={{ borderColor: "var(--nv-border)" }}
+      >
+        <div
+          className="text-[13px] font-[Geist,sans-serif] font-medium"
+          style={{ color: "var(--nv-text)" }}
+        >
+          Graph Filters
+        </div>
+        <button
+          onClick={onClose}
+          className="w-6 h-6 rounded flex items-center justify-center text-[14px] transition-colors"
+          style={{ color: "var(--nv-text-muted)" }}
+          aria-label="Close graph filters panel"
+          title="Close (Esc)"
+        >
+          ×
+        </button>
+      </div>
+
+      <div className="flex-1 overflow-y-auto">
+        {/* Performance — master switch. Lite derives a low-power preset
+            (the filters below are overridden for speed); Off unmounts the
+            graph entirely (re-enable from the placeholder or here). */}
+        <div className="px-4 py-3 border-b" style={{ borderColor: "var(--nv-border)" }}>
+          <div
+            className="text-[12px] font-[Geist,sans-serif] font-medium uppercase tracking-wider mb-2"
+            style={{ color: "var(--nv-text-muted)" }}
+          >
+            Performance
+          </div>
+          <div
+            className="flex gap-0.5 rounded-lg p-0.5"
+            style={{ background: "var(--nv-surface)", border: "1px solid var(--nv-border)" }}
+          >
+            {GRAPHMODE_LABELS.map((m) => (
+              <button
+                key={m.value}
+                onClick={() => s.setGraphMode(m.value)}
+                title={m.hint}
+                className="flex-1 px-2 py-1 text-[11px] font-medium font-[Geist,sans-serif] rounded transition-all"
+                style={
+                  s.graphMode === m.value
+                    ? {
+                        background: "var(--nv-bg)",
+                        color: "var(--nv-text)",
+                        border: "1px solid var(--nv-border)",
+                      }
+                    : { color: "var(--nv-text-muted)" }
+                }
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+          {s.graphMode === "lite" && (
+            <div
+              className="text-[10px] mt-1.5 font-[Geist,sans-serif]"
+              style={{ color: "var(--nv-text-muted)" }}
+            >
+              Lite overrides the filters below for speed; your settings return on Full.
+            </div>
+          )}
+        </div>
+
+        {/* Filters */}
+        <Section
+          title="Filters"
+          open={openSections.filters}
+          setOpen={() => toggleSection("filters")}
+        >
+          <input
+            type="text"
+            value={s.searchQuery}
+            onChange={(e) => s.setSearchQuery(e.target.value)}
+            placeholder="Find node…"
+            className="w-full text-[12px] px-2.5 py-1.5 rounded-md focus:outline-none font-[Geist,sans-serif]"
+            style={{
+              background: "var(--nv-surface)",
+              color: "var(--nv-text)",
+              border: "1px solid var(--nv-border)",
+            }}
+          />
+          <Toggle
+            label={`Show orphans (${orphanCount})`}
+            checked={s.showOrphans}
+            onChange={s.setShowOrphans}
+            hint="Isolated nodes (no edges) — render them in a halo around the connected vault."
+          />
+          <Toggle
+            label={`Semantic edges (${semanticEdgeCount})`}
+            checked={s.showSemanticEdges}
+            onChange={s.setShowSemanticEdges}
+            hint="Auto-computed cosine similarity edges. Off by default — they create a hairball at vault scale."
+          />
+          <Toggle
+            label="Manual links only"
+            checked={s.manualOnly}
+            onChange={s.setManualOnly}
+            hint="Hide entity + semantic edges. Show only [[wikilinks]] you typed."
+          />
+          {codeNodeCount > 0 && (
+            <Toggle
+              label={`Code layer (${codeNodeCount} files)`}
+              checked={s.showCode}
+              onChange={s.setShowCode}
+              hint="Graphified source files (gold nodes) and their call edges. Hide to see only your notes."
+            />
+          )}
+        </Section>
+
+        {/* Display */}
+        <Section
+          title="Display"
+          open={openSections.display}
+          setOpen={() => toggleSection("display")}
+        >
+          <Slider
+            label="Node size"
+            value={s.nodeSizeScale}
+            min={0.3}
+            max={3.0}
+            step={0.05}
+            onChange={s.setNodeSizeScale}
+            formatter={(v) => `${v.toFixed(2)}×`}
+          />
+          <Slider
+            label="Link thickness"
+            value={s.linkThicknessScale}
+            min={0.3}
+            max={3.0}
+            step={0.05}
+            onChange={s.setLinkThicknessScale}
+            formatter={(v) => `${v.toFixed(2)}×`}
+          />
+        </Section>
+
+        {/* Appearance — palette / shape / colour overrides */}
+        <Section
+          title="Appearance"
+          open={openSections.appearance}
+          setOpen={() => toggleSection("appearance")}
+        >
+          <div className="space-y-2">
+            <div
+              className="text-[11px] font-[Geist,sans-serif]"
+              style={{ color: "var(--nv-text-muted)" }}
+            >
+              Palette
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              {PALETTE_LABELS.map((p) => {
+                const colors = PALETTES[p.value];
+                const selected = s.palette === p.value;
+                return (
+                  <button
+                    key={p.value}
+                    onClick={() => s.setPalette(p.value)}
+                    title={p.hint}
+                    className="text-left rounded p-2 transition-all border"
+                    style={{
+                      background: "var(--nv-surface)",
+                      borderColor: selected ? "var(--nv-accent)" : "var(--nv-border)",
+                    }}
+                  >
+                    <div className="flex gap-0.5 mb-1">
+                      {colors.slice(0, 5).map((c: string, i: number) => (
+                        <span
+                          key={i}
+                          className="w-2.5 h-2.5 rounded-full"
+                          style={{ background: c }}
+                        />
+                      ))}
+                    </div>
+                    <p
+                      className="text-[10px] font-medium font-[Geist,sans-serif]"
+                      style={{ color: "var(--nv-text)" }}
+                    >
+                      {p.label}
+                    </p>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </Section>
+
+        {/* Layout */}
+        <div className="px-4 py-3 border-b" style={{ borderColor: "var(--nv-border)" }}>
+          <div
+            className="text-[12px] font-[Geist,sans-serif] font-medium uppercase tracking-wider mb-1.5"
+            style={{ color: "var(--nv-text-muted)" }}
+          >
+            Atlas layout
+          </div>
+          <p
+            className="text-[10px] font-[Geist,sans-serif] leading-snug"
+            style={{ color: "var(--nv-text-dim)" }}
+          >
+            Every composition is drawn from a deterministic layout — the same notes always land in the same places. Choose Time Rings, Constellation Islands, Neural Arbor, Connectome Halo, Memory Flow, or Knowledge Globe from the canvas pattern menu.
+          </p>
+        </div>
+
+        {/* Time-lapse */}
+        <Section
+          title="Time-lapse"
+          open={openSections.timelapse}
+          setOpen={() => toggleSection("timelapse")}
+        >
+          <p
+            className="text-[11px] font-[Geist,sans-serif] leading-snug"
+            style={{ color: "var(--nv-text-dim)" }}
+          >
+            Replay the order in which {nodeCount} notes were created — nodes appear in
+            chronological order, edges fade in once both endpoints are visible.
+          </p>
+          <Slider
+            label="Duration"
+            value={s.timelapseSpeedSec}
+            min={3}
+            max={60}
+            step={1}
+            onChange={s.setTimelapseSpeedSec}
+            formatter={(v) => `${v.toFixed(0)} s`}
+          />
+          <button
+            onClick={timelapseActive ? onTimelapseStop : onTimelapseStart}
+            className="w-full text-[12px] font-[Geist,sans-serif] font-medium px-3 py-2 rounded-md transition-all"
+            style={{
+              background: timelapseActive ? "var(--nv-negative)" : "var(--nv-accent)",
+              color: "var(--nv-bg)",
+            }}
+          >
+            {timelapseActive ? "Stop time-lapse" : "▶ Start time-lapse"}
+          </button>
+        </Section>
+      </div>
+    </div>
+  );
+}

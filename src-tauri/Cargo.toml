@@ -1,0 +1,271 @@
+[package]
+name = "neurovault"
+version = "0.6.2"
+description = "Local-first, AI-native memory for Claude and other LLM agents: markdown-canonical vault, hybrid retrieval, native MCP server"
+authors = ["NeuroVault contributors"]
+license = "MIT"
+repository = "https://github.com/sirdath/NeuroVault"
+keywords = ["mcp", "memory", "ai", "local-first", "tauri"]
+edition = "2021"
+# Two binary targets exist in this crate:
+#   - `neurovault`         the Tauri desktop app (src/main.rs)
+#   - `neurovault-server`  the standalone HTTP server (src/bin/...)
+# `cargo run` and `tauri dev` need to know which one is "the app";
+# declare it explicitly so neither command panics with "ambiguous bin".
+default-run = "neurovault"
+
+[lib]
+name = "neurovault_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+# Release-build tuning. Cargo's default release profile is already
+# `opt-level = 3` (Tauri does NOT override this), so the wins here
+# come from cross-crate optimisation + dead-code elimination:
+#
+#   lto = "fat"          — link-time optimisation across every crate;
+#                          ~5-15% speedup on fastembed/ONNX hot paths
+#                          where the compiler can inline tensor ops
+#                          across crate boundaries. Link time goes
+#                          from ~60s → ~3-4min, but that's only the
+#                          release build, not dev.
+#   codegen-units = 1    — one compilation unit = better optimisation
+#                          than the default 16 parallel units. ~3-10%
+#                          extra speedup in tight inner loops.
+#   strip = "symbols"    — removes debug symbols; ~25% smaller exe.
+#                          Release binaries don't need them; users
+#                          can't read them anyway.
+#   panic = unwind       — the default, restored 2026-07-20. This was
+#                          "abort" for a smaller binary, justified as
+#                          "we never catch panics anyway (Tauri's event
+#                          loop converts them to process exits)". True
+#                          of the GUI thread, FALSE of the axum server:
+#                          hyper serves each connection in its own tokio
+#                          task, so unwinding contains a handler panic
+#                          to that one request. `abort` threw that
+#                          isolation away.
+#
+#                          The cost was severe and invisible. A pre-
+#                          release audit found five UTF-8 boundary
+#                          panics reachable from ordinary input (a
+#                          Japanese recall query, an accented note
+#                          title). Under `abort` each was a SIGABRT
+#                          killing the whole desktop app — editor,
+#                          webview, watcher, unsaved work — while
+#                          `cargo test` and `tauri dev` build with
+#                          unwind and showed only a dropped connection.
+#                          Those five are fixed; the next one should
+#                          cost a request, not the app.
+#
+# Dev profile intentionally NOT touched — we don't want 4-minute
+# incremental rebuilds during iteration.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+[features]
+# `gui` pulls in Tauri + all desktop plugins and compiles `app.rs`. Default ON
+# so `cargo build` / `tauri dev` build the full app. A `--no-default-features`
+# build (used for the headless `neurovault-server` shipped via npm) drops Tauri
+# entirely, so the binary links no WebKit/GTK and runs on a headless host.
+default = ["gui"]
+gui = [
+  "dep:tauri",
+  "dep:tauri-plugin-fs",
+  "dep:tauri-plugin-shell",
+  "dep:tauri-plugin-global-shortcut",
+  "dep:tauri-plugin-dialog",
+  "dep:tauri-plugin-deep-link",
+  "dep:tauri-plugin-single-instance",
+  "dep:tauri-plugin-updater",
+  "dep:tauri-plugin-process",
+]
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"], optional = true }
+tauri-plugin-fs = { version = "2", optional = true }
+tauri-plugin-shell = { version = "2", optional = true }
+tauri-plugin-global-shortcut = { version = "2", optional = true }
+tauri-plugin-dialog = { version = "2", optional = true }
+# Phase 7b: `neurovault://engram/<id>` URL scheme. Claude Code can
+# emit clickable links in chat that jump the user straight to an
+# engram. The `single-instance` plugin (with the `deep-link` feature)
+# makes sure clicking a link while the app is already open forwards
+# the URL to the running instance instead of spawning a duplicate.
+tauri-plugin-deep-link = { version = "2", optional = true }
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"], optional = true }
+# In-app updater. Registered always; it only does work when a
+# `plugins.updater` block (endpoints + pubkey) is present in
+# tauri.conf.json. Until the signing keypair + CI signing step land, the
+# native `check()` path no-ops and the UI falls back to opening the
+# GitHub release page. See docs/UPDATER-SETUP.md to turn it on.
+tauri-plugin-updater = { version = "2", optional = true }
+tauri-plugin-process = { version = "2", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v5"] }
+slug = "0.1"
+dirs = "6"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# --- Rust memory-layer dependencies -----------------------------------
+# These power the in-process backend that replaced the Python HTTP
+# sidecar: SQLite + sqlite-vec, ONNX embeddings, axum, tokio, notify.
+# Kept minimal on purpose — anything a single memory:: module needs
+# is declared here; heavy optional features stay opt-in.
+
+# SQLite driver for the brain.db read/write path (Phase 2).
+# `bundled` vendors SQLite so we don't link against a system libsqlite
+# that may lack load_extension. `buildtime_bindgen` lets us expose the
+# load_extension C entry that sqlite-vec needs at runtime.
+rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
+
+# ONNX Runtime inference + text embedding (Phase 3). fastembed-rs
+# downloads the exact same BGE-small-en-v1.5 model the Python side
+# uses, into the same ~/.neurovault/.fastembed_cache/ directory — zero re-download
+# on first Rust invocation for existing users.
+#
+# `ort-download-binaries` keeps onnxruntime fetched + STATICALLY linked (verified
+# via otool: no libonnxruntime). `hf-hub-rustls-tls` (instead of the default
+# `hf-hub-native-tls`) routes the model download through pure-Rust rustls + a
+# bundled CA store rather than system OpenSSL — so the headless binary needs no
+# libssl.so at runtime and no libssl-dev at build time, which is what makes a
+# slim/Alpine/Docker Linux build viable.
+fastembed = { version = "4", default-features = false, features = [
+    "ort-download-binaries",
+    "hf-hub-rustls-tls",
+] }
+
+# Synchronisation primitives the ported modules will use:
+# once_cell     — lazy singletons (embedder, BM25, config)
+# parking_lot   — faster Mutex/RwLock than std's, matches Python LRU
+#                 behaviour where readers don't block each other
+# thiserror     — clean error types at the memory:: boundary so
+#                 Tauri command results round-trip cleanly
+once_cell = "1"
+parking_lot = "0.12"
+thiserror = "1"
+
+# Pure-Rust regex engine used by the chunker, summaries, entities
+# port. Matches Python `re` module semantics closely enough that the
+# cross-language output tests Phase 3 requires pass without adjustment.
+regex = "1"
+
+# UAX#29 text segmentation. The curator's SEG_V1 prose pass
+# (`memory/adaptive/curator/segment.rs`) uses
+# `split_sentence_bound_indices()` so sentence boundaries are a pure
+# function of a pinned crate + Unicode data version — no locale data, no
+# ML, byte offsets for free. The version is recorded in
+# `segment::UNICODE_SEGMENTATION_CRATE_VERSION` and asserted against
+# Cargo.lock by a test: bumping the crate without bumping
+# SEGMENTER_VERSION fails CI (spec §5.2 step 2).
+unicode-segmentation = "=1.13.2"
+
+# Identity canonicalization (spec §12.5): NFC before hashing, in
+# `identity::canonicalize_value`. Pinned exact for the same reason as
+# unicode-segmentation — a Unicode data update must be a deliberate,
+# versioned decision (IDENTITY_VERSION bump), never a silent digest change.
+unicode-normalization = "=0.1.24"
+
+# SHA-256 for the `content_hash` column used by ingest's "skip if
+# unchanged" check (Phase 5). Python stores `hashlib.sha256(content).hexdigest()`
+# — we match so a row written by either runtime is seen as unchanged
+# by the other and doesn't trigger an unnecessary re-embed.
+sha2 = "0.10"
+# O_NOFOLLOW on Unix closes the final-component symlink race when the
+# curator opens a validated transcript path.
+libc = "0.2"
+
+# Phase 6: async runtime + HTTP server. `tokio` powers axum's event
+# loop. `axum` gives us the same `/api/*` surface the Python FastAPI
+# server exposed — same URLs, same JSON shapes — so `mcp_proxy.py`
+# keeps working unchanged while Python is retired.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "process", "io-util"] }
+axum = "0.7"
+# CORS for the localhost HTTP server. The Tauri webview's origin is
+# `tauri://localhost` (or `https://tauri.localhost`); plain `fetch()`
+# from there to `http://127.0.0.1:8765` is cross-origin and fails the
+# preflight without these headers. The server binds to 127.0.0.1 only
+# (no LAN exposure) so permissive CORS doesn't widen any attack
+# surface — it just lets the same machine's webview talk to its own
+# backend.
+tower-http = { version = "0.5", features = ["cors", "catch-panic"] }
+
+# API gateway (the optional external HTTP API). blake3 hashes API
+# keys at rest — fast, constant-time-able, plenty of entropy for
+# 144-bit secrets so password-style KDFs (argon2/bcrypt) are
+# overkill here. `subtle` for constant-time comparison so timing
+# can't leak which key matched. `getrandom` for the cryptographic
+# random secret bytes; `base64` for url-safe encoding so keys are
+# copy-pasteable and shell-safe.
+blake3 = "1.5"
+subtle = "2.5"
+getrandom = "0.2"
+base64 = "0.22"
+
+# Timestamp parsing for the retriever's recency-decay prior. SQLite
+# writes ISO-8601-ish strings via `strftime`; we parse them into
+# `OffsetDateTime` to compute age_days. `formatting` + `parsing` +
+# `macros` cover compile-time format descriptions.
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+
+# Phase 7: cross-platform filesystem watcher. Replaces Python's
+# `watchdog`-based vault watcher. `notify` fires on create/modify/
+# remove; we layer a 500ms per-file debounce on top so an editor
+# save burst (atomic rename + multiple fsyncs) collapses into one
+# ingest call per write.
+notify = "6"
+
+# Native MCP stdio server (`neurovault-server --mcp-only`). rmcp is the
+# official Rust MCP SDK; we run it as a stdio server that forwards every
+# tool call over HTTP to the already-running app on 127.0.0.1:8765 — so
+# this code path does ZERO heavy init (no fastembed, no rusqlite) and
+# never binds 8765 itself. `reqwest` is the HTTP client for that forward
+# (it is NOT an MCP transport — the app speaks plain /api/* REST). Both
+# are lean (no default features) to keep the binary small.
+rmcp = { version = "1", default-features = false, features = ["server", "macros", "transport-io"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# ── graphify: parse a codebase into the local knowledge graph (Phase 1).
+# tree-sitter runs entirely in-process (C grammars compiled via `cc`) — no
+# network, no model; source never leaves the machine. `ignore` gives a
+# .gitignore-aware repo walker (the ripgrep engine). Grammars are added
+# incrementally; Rust first to prove the pipeline.
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+# Pinned: c-sharp 0.23.2+ ships grammar ABI 15, but the tree-sitter 0.24 core
+# accepts max ABI 14 (0.23.1 is the last ABI-14 build). Bump only alongside the
+# tree-sitter core. Other grammars (go/java/ruby 0.23) are already ABI ≤14.
+tree-sitter-c-sharp = "=0.23.1"
+tree-sitter-ruby = "0.23"
+ignore = "0.4"
+
+# Self-heal on bind-failure: if `127.0.0.1:8765` is held by a stale
+# `neurovault*` process at startup, identify the holder and kill it
+# rather than failing silently. `netstat2` gives us the cross-platform
+# port → PID lookup; `sysinfo` resolves PID → process name so we can
+# verify it's a stale instance of OURS before killing anything. Both
+# are read-only inspection except for the `kill` action, which is
+# gated behind a name-prefix check (only processes whose name starts
+# with "neurovault" get terminated).
+# Scoped to non-Linux: netstat2 0.9 fails to compile on Linux (libc
+# `tcp_info` mismatch) and these are only used by port_recovery, which
+# degrades to a no-op on Linux (see that module). Keeps Windows + macOS
+# auto-recovery while letting the Linux build/CI go green.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+netstat2 = "0.9"
+sysinfo = "0.30"
+
+[dev-dependencies]
+# `tower::ServiceExt::oneshot` lets router tests drive the axum app
+# in-process without binding a port. Used by the panic-isolation test
+# in memory::http_server, which asserts a handler panic becomes a 500
+# rather than killing the process.
+tower = { version = "0.5", features = ["util"] }

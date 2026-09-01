@@ -1,0 +1,9172 @@
+//! HTTP handler functions and their request/response types.
+//!
+//! Every endpoint's logic lives here. Two routers mount these:
+//!
+//!   • `super::http_server::router` — loopback-only, zero auth.
+//!     Serves the Tauri webview and the local Python MCP proxy.
+//!     Same `/api/*` paths the original Python FastAPI sidecar used.
+//!
+//!   • `super::api_gateway::router` (planned) — external bind,
+//!     bearer auth, scope check. Mounts the same handlers under a
+//!     `/v1/*` prefix.
+//!
+//! Handlers are router-agnostic: they take their extractors, do
+//! the work, return their result. Knowing which router invoked
+//! them is none of their business.
+//!
+//! Endpoints exposed today:
+//!   GET  /api/health                — liveness probe
+//!   GET  /api/status                — brain stats summary
+//!   GET  /api/brains                — list brains + active marker
+//!   GET  /api/brains/active         — just the active id + name
+//!   POST /api/brains/{id}/activate  — switch active brain
+//!   GET  /api/brains/{id}/stats     — disk/note counts
+//!   GET  /api/notes                 — sidebar list
+//!   GET  /api/notes/{engram_id}     — single note + connections
+//!   GET  /api/graph                 — knowledge graph payload
+//!   GET  /api/recall                — hybrid retrieval
+//!   …and ~40 more (see super::http_server::router for the full mount).
+
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Json};
+use serde::{Deserialize, Serialize};
+
+use super::core_memory::{self, CoreBlock};
+use super::db::open_brain;
+use super::ingest;
+use super::read_ops::{
+    brain_stats, get_graph, get_note, list_brains_with_stats, list_notes, resolve_brain_id,
+    BrainStats, BrainSummary, FullNote, NoteListRow,
+};
+use super::related::{get_related_checked, RelatedHit, RelatedOpts};
+use super::retriever::{hybrid_retrieve_throttled, RecallHit, RecallOpts};
+use super::todos::{self, AddTodoArgs, Todo};
+use super::types::{GraphData, MemoryError};
+
+/// Shared state extracted by every handler. Empty today — kept as a
+/// type so axum's `State<ServerState>` extractor pattern is uniform
+/// and we can attach things like a request-id generator or a metrics
+/// handle later without changing every handler signature.
+#[derive(Clone)]
+pub struct ServerState {}
+
+// ---- Error handling ------------------------------------------------------
+
+/// Wrap `MemoryError` so axum can render it as JSON with a status
+/// code the frontend + MCP proxy already understand (404 for
+/// not-found, 500 for everything else).
+#[derive(Debug)]
+pub struct ApiError(pub StatusCode, pub String);
+
+impl From<MemoryError> for ApiError {
+    fn from(e: MemoryError) -> Self {
+        match e {
+            MemoryError::BrainNotFound(id) => {
+                ApiError(StatusCode::NOT_FOUND, format!("brain not found: {}", id))
+            }
+            MemoryError::EngramNotFound(id) => {
+                ApiError(StatusCode::NOT_FOUND, format!("engram not found: {}", id))
+            }
+            other => ApiError(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        #[derive(Serialize)]
+        struct ErrorBody {
+            error: String,
+        }
+        (self.0, Json(ErrorBody { error: self.1 })).into_response()
+    }
+}
+
+// ---- Handlers -----------------------------------------------------------
+
+pub async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status": "ok", "service": "neurovault-rust"}))
+}
+
+#[derive(Serialize)]
+pub struct FreshnessBreakdown {
+    fresh: i64,
+    active: i64,
+    dormant: i64,
+    total: i64,
+}
+
+#[derive(Serialize)]
+pub struct LinkBreakdown {
+    manual: i64,
+    entity: i64,
+    semantic: i64,
+    other: i64,
+    total: i64,
+}
+
+#[derive(Serialize)]
+pub struct StatusBody {
+    brain: String,
+    // Existing fields — kept stable for older consumers (SettingsView,
+    // session_start). Do not rename or remove without bumping the
+    // shape version.
+    memories: i64,
+    chunks: i64,
+    entities: i64,
+    connections: i64,
+    // New in v0.1.6+: brain-health snapshot. Backs the MCP `status`
+    // tool so an agent can probe "is this brain healthy?" in one call
+    // without scraping multiple endpoints.
+    freshness: FreshnessBreakdown,
+    links: LinkBreakdown,
+}
+
+/// GET /api/version — the running backend's version + pid. No auth, no DB
+/// access (answers before any brain exists). Lets a launcher / MCP shim detect
+/// version skew against a backend already listening on :8765 — the shared
+/// singleton port that the desktop app, a prior `npx` session, or a curl-
+/// installed binary all bind (first wins) — and gives a "kill PID N" target
+/// when the live backend is older than the caller.
+pub async fn version(_s: State<ServerState>) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "pid": std::process::id(),
+    })))
+}
+
+pub async fn status(_s: State<ServerState>) -> Result<Json<StatusBody>, ApiError> {
+    let id = resolve_brain_id(None)?;
+    let db = open_brain(&id)?;
+    let conn = db.lock();
+    let memories: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM engrams WHERE state != 'dormant'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let chunks: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+        .unwrap_or(0);
+    let entities: i64 = conn
+        .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
+        .unwrap_or(0);
+    let connections: i64 = conn
+        .query_row("SELECT COUNT(*) FROM engram_links", [], |r| r.get(0))
+        .unwrap_or(0);
+    // Freshness breakdown — single GROUP BY query, three buckets +
+    // total. "fresh" = recently created or accessed (Ebbinghaus prior
+    // is high); "active" = stable in circulation; "dormant" = decayed
+    // past the threshold and excluded from default recall results.
+    let count_state = |state: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM engrams WHERE state = ?1",
+            [state],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    };
+    let f_fresh = count_state("fresh");
+    let f_active = count_state("active");
+    let f_dormant = count_state("dormant");
+    let f_total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM engrams", [], |r| r.get(0))
+        .unwrap_or(0);
+    let count_link = |kind: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM engram_links WHERE link_type = ?1",
+            [kind],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    };
+    let l_manual = count_link("manual");
+    let l_entity = count_link("entity");
+    let l_semantic = count_link("semantic");
+    let l_other = (connections - l_manual - l_entity - l_semantic).max(0);
+    Ok(Json(StatusBody {
+        brain: id,
+        memories,
+        chunks,
+        entities,
+        connections,
+        freshness: FreshnessBreakdown {
+            fresh: f_fresh,
+            active: f_active,
+            dormant: f_dormant,
+            total: f_total,
+        },
+        links: LinkBreakdown {
+            manual: l_manual,
+            entity: l_entity,
+            semantic: l_semantic,
+            other: l_other,
+            total: connections,
+        },
+    }))
+}
+
+pub async fn brains_list(_s: State<ServerState>) -> Result<Json<Vec<BrainSummary>>, ApiError> {
+    Ok(Json(list_brains_with_stats()?))
+}
+
+#[derive(Serialize)]
+pub struct ActiveBrainBody {
+    id: String,
+}
+
+pub async fn brains_active(_s: State<ServerState>) -> Result<Json<ActiveBrainBody>, ApiError> {
+    Ok(Json(ActiveBrainBody {
+        id: resolve_brain_id(None)?,
+    }))
+}
+
+pub async fn brains_activate(
+    Path(brain_id): Path<String>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Rewrite brains.json → active=brain_id. Same operation the
+    // existing Tauri command `set_active_brain_offline` does.
+    use std::fs;
+
+    use super::paths::registry_path;
+    let data = fs::read_to_string(registry_path())
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut parsed: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let brain_name = parsed
+        .get("brains")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(&brain_id))
+        })
+        .and_then(|brain| brain.get("name").and_then(|value| value.as_str()))
+        .unwrap_or(&brain_id)
+        .to_string();
+    let exists = parsed
+        .get("brains")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| {
+            arr.iter()
+                .any(|b| b.get("id").and_then(|v| v.as_str()) == Some(&brain_id))
+        });
+    if !exists {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("brain not found: {}", brain_id),
+        ));
+    }
+    parsed["active"] = serde_json::Value::String(brain_id.clone());
+    let serialised = serde_json::to_string_pretty(&parsed)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    fs::write(registry_path(), serialised)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "active": brain_id,
+        "brain_id": brain_id,
+        "name": brain_name,
+    })))
+}
+
+pub async fn brains_stats(
+    Path(brain_id): Path<String>,
+    _s: State<ServerState>,
+) -> Result<Json<BrainStats>, ApiError> {
+    Ok(Json(brain_stats(&brain_id)?))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/audit/recent?limit=N — recent tool-call activity for the
+// active brain. Drives the UI's Activity panel + the audit log view
+// in Settings. Reads the last N entries from `<brain>/audit.jsonl`
+// (newest first). Missing file = empty list.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+pub struct AuditRecentQuery {
+    /// How many entries to return. Defaults to 50 to match the
+    /// frontend's `activityApi.recent(limit = 50)` default.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Brain to read from. Defaults to the active brain when absent —
+    /// matches the rest of the read-side API.
+    #[serde(default)]
+    pub brain: Option<String>,
+}
+
+pub async fn audit_recent(
+    Query(q): Query<AuditRecentQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<Vec<super::tool_audit::AuditEntry>>, ApiError> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let brain_id = resolve_brain_id(q.brain.as_deref())?;
+    let entries = super::tool_audit::recent(&brain_id, limit)?;
+    Ok(Json(entries))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/observations — Claude Code lifecycle-hook capture.
+//
+// Called by the native `neurovault-hook` binary (the shim wired into the
+// user's Claude Code settings.json) on every SessionStart, UserPromptSubmit,
+// PostToolUse, and SessionEnd event. Each event becomes an observation
+// engram tagged with the session id so the whole session can later be
+// retrieved as a unit.
+//
+// Body shape: { "event": "PostToolUse", "payload": {...} }
+//   (`hook_event_name` is accepted as an alias for `event` to match
+//   Claude Code's native hook payload shape.)
+//
+// PostToolUse policy via NEUROVAULT_HOOKS_POSTTOOLUSE env var:
+//   "mutations" (default) — only Edit / Write / NotebookEdit / MultiEdit
+//   "all"                 — every tool
+//   "off"                 — skip PostToolUse entirely
+// Mutations-only is the right default — read-only tools (Read, Grep,
+// Bash, Glob) fire dozens per minute during a coding session and drown
+// the vault in noise.
+//
+// Privacy: any text inside `<private>...</private>` tags is stripped
+// before persistence, matching claude-mem's convention for users who
+// migrate from there.
+//
+// Filename convention: `obs-{short_session}-{event_lower}-{short_uuid}.md`
+// inside the vault dir so the markdown round-trips through the normal
+// ingest pipeline. After ingest, the engram is tagged
+// `kind='observation', agent_id='claude-code'` so it stays filterable.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct ObservationBody {
+    #[serde(default)]
+    pub event: Option<String>,
+    /// Claude Code's hook envelope uses this field name. We accept both
+    /// so the same handler works whether the caller posts the wrapper
+    /// shape or a raw hook payload.
+    #[serde(default)]
+    pub hook_event_name: Option<String>,
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    /// Brain to ingest into. Optional — falls back to the active brain
+    /// from the registry. Hooks normally don't set this.
+    #[serde(default)]
+    pub brain: Option<String>,
+    /// Pass-through fields when the hook posts a flat (un-wrapped)
+    /// payload directly. We catch them via `flatten` so the handler
+    /// can still find session_id, tool_name, prompt, etc.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub struct ObservationResult {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engram_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    pub event: String,
+}
+
+/// Hook events we ingest. `Stop` exists in the Claude Code hook surface
+/// but is a no-op pause — skipping it keeps the observation stream
+/// focused on signal-bearing events.
+const OBSERVATION_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PostToolUse",
+    "SessionEnd",
+];
+
+/// Tools considered "mutations" — the default PostToolUse policy
+/// captures only these. Read/Grep/Bash/Glob fire too often to be
+/// useful and would dominate the vault.
+const MUTATION_TOOLS: &[&str] = &["edit", "write", "notebookedit", "multiedit"];
+
+pub async fn observations(
+    _s: State<ServerState>,
+    Json(body): Json<ObservationBody>,
+) -> Result<Json<ObservationResult>, ApiError> {
+    // Normalize the body. Hook callers vary: the Python proxy used to
+    // wrap as {event, payload}; raw Claude Code hooks post flat shape
+    // with hook_event_name + session_id + tool_name at the top level.
+    let event = body
+        .event
+        .clone()
+        .or(body.hook_event_name.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    // Merge `payload` (when wrapped) with the flat top-level fields
+    // (when raw) so downstream lookups see a single object regardless
+    // of caller shape.
+    let mut payload = serde_json::Map::new();
+    if let Some(serde_json::Value::Object(m)) = body.payload.clone() {
+        payload.extend(m);
+    }
+    for (k, v) in body.extra.iter() {
+        payload.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+
+    // Filter — known events only. Unknowns are tolerated (returns
+    // skipped) rather than rejected so a future Claude Code version
+    // adding new hook types doesn't break us.
+    if !OBSERVATION_EVENTS.iter().any(|e| *e == event) {
+        return Ok(Json(ObservationResult {
+            status: "skipped_unknown_event".to_string(),
+            engram_id: None,
+            filename: None,
+            event,
+        }));
+    }
+
+    // PostToolUse policy. Default "mutations" keeps the vault clean —
+    // override per-environment with NEUROVAULT_HOOKS_POSTTOOLUSE=all
+    // when debugging or with =off to silence entirely.
+    if event == "PostToolUse" {
+        let mode = std::env::var("NEUROVAULT_HOOKS_POSTTOOLUSE")
+            .unwrap_or_else(|_| "mutations".to_string())
+            .to_lowercase();
+        if mode == "off" {
+            return Ok(Json(ObservationResult {
+                status: "skipped_posttooluse_off".to_string(),
+                engram_id: None,
+                filename: None,
+                event,
+            }));
+        }
+        if mode == "mutations" {
+            let tool = payload
+                .get("tool_name")
+                .or_else(|| payload.get("tool"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if !MUTATION_TOOLS.iter().any(|m| *m == tool) {
+                return Ok(Json(ObservationResult {
+                    status: "skipped_non_mutation".to_string(),
+                    engram_id: None,
+                    filename: None,
+                    event,
+                }));
+            }
+        }
+    }
+
+    let (title, markdown) = format_observation(&event, &payload);
+
+    // Brain resolution precedence:
+    //   1. Explicit `brain` in the request body (rare — callers normally
+    //      don't set this).
+    //   2. `NEUROVAULT_OBSERVATIONS_BRAIN` env var on the server. Set
+    //      this in production deployments to keep hook-captured noise
+    //      out of whatever brain the user is actively recalling from.
+    //      Critical for bench runs: without it, the bench's active
+    //      brain (e.g. `longmemeval-bench`) ends up polluted with the
+    //      operator's own Claude Code lifecycle events while the bench
+    //      is in flight, contaminating recall results.
+    //   3. The currently active brain (legacy default — fine for
+    //      single-user single-task setups where the active brain IS
+    //      the place to log activity).
+    let brain_override = body.brain.clone().or_else(|| {
+        std::env::var("NEUROVAULT_OBSERVATIONS_BRAIN")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    });
+
+    let result = tokio::task::spawn_blocking(move || -> Result<ObservationResult, MemoryError> {
+        let id = resolve_brain_id(brain_override.as_deref())?;
+        let _ = super::db::open_brain(&id)?;
+
+        // Filename pattern matches the legacy Python convention so
+        // existing vaults stay queryable: obs-{short_session}-{event}-{uuid6}.md
+        let session_id = payload
+            .get("session_id")
+            .or_else(|| payload.get("sessionId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let short_session: String = session_id.chars().take(8).collect();
+        let short_uuid: String = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(6)
+            .collect();
+        let filename = format!(
+            "obs-{}-{}-{}.md",
+            short_session,
+            event.to_lowercase(),
+            short_uuid,
+        );
+
+        let body_text = format!("# {}\n\n{}", title, markdown);
+
+        // Write through the normal save_note path so the ingest
+        // pipeline (chunking, embedding, BM25, entities, links) runs
+        // exactly the same way it does for user-authored markdown.
+        // Going through the filesystem also preserves the
+        // markdown-as-source-of-truth invariant.
+        let vault = super::read_ops::resolve_vault_path(&id)?;
+        let ctx = super::write_ops::BrainContext::resolve(Some(&id), vault)?;
+        let written = super::write_ops::save_note(&ctx, &filename, &body_text)?;
+
+        // Tag as observation so callers can filter for the hook stream
+        // with `kind:observation`. Stamping agent_id='claude-code' lets
+        // multi-agent setups distinguish auto-captured hook events from
+        // user `remember()` calls. Failure here isn't fatal — the
+        // engram is already persisted, just untagged.
+        {
+            let db = super::db::open_brain(&id)?;
+            let conn = db.lock();
+            if let Err(e) = conn.execute(
+                "UPDATE engrams SET kind = 'observation', agent_id = 'claude-code' WHERE id = ?1",
+                [&written.engram_id],
+            ) {
+                eprintln!("[observations] tag failed for {}: {}", written.engram_id, e);
+            }
+        }
+
+        // Audit the observation capture so it shows up in the
+        // Activity panel. Args are kept small (just event + tool)
+        // because the full payload can be large (file diffs, etc.).
+        let mut audit_args = serde_json::Map::new();
+        audit_args.insert(
+            "event".to_string(),
+            serde_json::Value::String(event.clone()),
+        );
+        if let Some(tool) = payload
+            .get("tool_name")
+            .or_else(|| payload.get("tool"))
+            .and_then(|v| v.as_str())
+        {
+            audit_args.insert(
+                "tool".to_string(),
+                serde_json::Value::String(tool.to_string()),
+            );
+        }
+        let mut audit_entry = super::tool_audit::AuditEntry::new("observations")
+            .with_args(serde_json::Value::Object(audit_args))
+            .with_modified_ids(vec![written.engram_id.clone()])
+            .with_session_id(session_id.clone())
+            .with_status(200);
+        if let Some(s) = payload
+            .get("session_id")
+            .or_else(|| payload.get("sessionId"))
+            .and_then(|v| v.as_str())
+        {
+            audit_entry = audit_entry.with_session_id(s.to_string());
+        }
+        let _ = super::tool_audit::append(&id, &audit_entry);
+
+        Ok(ObservationResult {
+            status: written.status,
+            engram_id: Some(written.engram_id),
+            filename: Some(filename),
+            event: event.clone(),
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+
+    Ok(Json(result))
+}
+
+/// Convert a hook payload to `(title, markdown_body)`. Each event type
+/// gets a tailored shape so observations read cleanly in the UI later.
+/// Mirrors the legacy Python formatter so existing markdown files in
+/// users' vaults stay structurally compatible with newly-written ones.
+fn format_observation(
+    event: &str,
+    payload: &serde_json::Map<String, serde_json::Value>,
+) -> (String, String) {
+    let session_id = payload
+        .get("session_id")
+        .or_else(|| payload.get("sessionId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let short_session: String = session_id.chars().take(8).collect();
+    let timestamp = payload
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            // ISO 8601 / RFC 3339 in UTC. Matches the legacy Python
+            // format so observations from old + new servers sort
+            // consistently in a vault that has both.
+            use time::format_description::well_known::Iso8601;
+            use time::OffsetDateTime;
+            OffsetDateTime::now_utc()
+                .format(&Iso8601::DEFAULT)
+                .unwrap_or_else(|_| "unknown".to_string())
+        });
+
+    match event {
+        "SessionStart" => {
+            let cwd = payload.get("cwd").and_then(|v| v.as_str()).unwrap_or("?");
+            (
+                format!("Session start · {}", short_session),
+                format!(
+                    "**Event:** SessionStart\n**Session:** `{}`\n**Started:** {}\n**Cwd:** `{}`\n",
+                    session_id, timestamp, cwd
+                ),
+            )
+        }
+        "UserPromptSubmit" => {
+            let prompt_raw = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+            let prompt = strip_private(prompt_raw);
+            let short_prompt = short_summary(&prompt, 60);
+            (
+                format!("User prompt · {}", short_prompt),
+                format!(
+                    "**Event:** UserPromptSubmit\n**Session:** `{}`\n**Time:** {}\n\n## Prompt\n\n{}\n",
+                    session_id, timestamp, prompt
+                ),
+            )
+        }
+        "PostToolUse" => {
+            let tool = payload
+                .get("tool_name")
+                .or_else(|| payload.get("tool"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let tool_input = payload
+                .get("tool_input")
+                .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
+                .unwrap_or_default();
+            let tool_input = truncate(&tool_input, 1500);
+            let tool_output_raw = payload
+                .get("tool_response")
+                .or_else(|| payload.get("output"))
+                .map(|v| {
+                    v.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| v.to_string())
+                })
+                .unwrap_or_default();
+            let tool_output = truncate(&strip_private(&tool_output_raw), 2000);
+            (
+                format!("{} · {}", tool, short_session),
+                format!(
+                    "**Event:** PostToolUse\n**Session:** `{}`\n**Tool:** `{}`\n**Time:** {}\n\n\
+                     ## Input\n\n```json\n{}\n```\n\n## Output\n\n```\n{}\n```\n",
+                    session_id, tool, timestamp, tool_input, tool_output
+                ),
+            )
+        }
+        "SessionEnd" => {
+            let summary_raw = payload
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let summary = strip_private(summary_raw);
+            let mut body = format!(
+                "**Event:** SessionEnd\n**Session:** `{}`\n**Ended:** {}\n",
+                session_id, timestamp
+            );
+            if !summary.is_empty() {
+                body.push_str(&format!("\n## Summary\n\n{}\n", summary));
+            }
+            (format!("Session end · {}", short_session), body)
+        }
+        other => {
+            let dump = serde_json::Value::Object(payload.clone()).to_string();
+            let dump = truncate(&dump, 2000);
+            (
+                format!("{} · {}", other, short_session),
+                format!(
+                    "**Event:** {}\n**Session:** `{}`\n**Time:** {}\n\n```json\n{}\n```\n",
+                    other, session_id, timestamp, dump
+                ),
+            )
+        }
+    }
+}
+
+/// Strip `<private>...</private>` blocks. Matches claude-mem's
+/// convention so migrating users get the same UX. Case-insensitive
+/// and DOTALL so the tag can wrap multi-line content.
+fn strip_private(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    // Simple state-machine replace — avoids pulling in the `regex`
+    // crate just for one pattern. Walks the string once, emits chunks
+    // between/outside `<private>`/`</private>` markers, drops the
+    // wrapped content. Tag matching is case-insensitive.
+    const OPEN: &str = "<private>";
+    const CLOSE: &str = "</private>";
+    // ASCII-only lowercasing: offsets found in `lower` are reused to
+    // slice `text`, and full `to_lowercase()` can change a char's byte
+    // length (`İ` 2→3, `ẞ` 3→2), desyncing the two. The tags are ASCII,
+    // so this still matches `<PRIVATE>` while keeping byte positions.
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while cursor < text.len() {
+        if let Some(start_rel) = lower[cursor..].find(OPEN) {
+            let start = cursor + start_rel;
+            out.push_str(&text[cursor..start]);
+            let after_open = start + OPEN.len();
+            if let Some(end_rel) = lower[after_open..].find(CLOSE) {
+                out.push_str("[private content removed]");
+                cursor = after_open + end_rel + CLOSE.len();
+            } else {
+                // Unclosed tag — keep the original suffix verbatim
+                // rather than swallowing the rest of the message.
+                out.push_str(&text[start..]);
+                break;
+            }
+        } else {
+            out.push_str(&text[cursor..]);
+            break;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod strip_private_tests {
+    use super::*;
+
+    #[test]
+    fn strips_block_after_length_growing_char() {
+        // `İ` is 2 bytes but full-lowercases to 3, so offsets found in a
+        // `to_lowercase()` copy no longer address the source. Payloads are
+        // agent-controlled, so a skew here either panics on a non-boundary
+        // slice (the hook event is dropped) or leaks the private span.
+        assert_eq!(
+            strip_private("İ<private>secret</private>é more"),
+            "İ[private content removed]é more"
+        );
+    }
+
+    #[test]
+    fn strips_block_after_length_shrinking_char() {
+        // The other direction: `ẞ` is 3 bytes, lowercases to 2.
+        assert_eq!(
+            strip_private("ẞ<private>x</private>tail"),
+            "ẞ[private content removed]tail"
+        );
+    }
+
+    #[test]
+    fn strips_uppercase_tags() {
+        assert_eq!(
+            strip_private("a <PRIVATE>UPPER</PRIVATE> b"),
+            "a [private content removed] b"
+        );
+    }
+
+    #[test]
+    fn unclosed_tag_keeps_suffix_verbatim() {
+        assert_eq!(
+            strip_private("head <private>no close here"),
+            "head <private>no close here"
+        );
+    }
+}
+
+/// One-line summary for titles. Replaces newlines with spaces and caps
+/// to `n` chars + an ellipsis. Char-aware so multibyte input doesn't
+/// panic at byte boundaries.
+fn short_summary(text: &str, n: usize) -> String {
+    let collapsed: String = text
+        .trim()
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
+    if collapsed.chars().count() <= n {
+        return collapsed;
+    }
+    let truncated: String = collapsed.chars().take(n).collect();
+    format!("{}…", truncated)
+}
+
+/// Char-aware truncate with `... [truncated]` suffix when cut.
+fn truncate(text: &str, n: usize) -> String {
+    if text.chars().count() <= n {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(n).collect();
+    format!("{}\n... [truncated]", truncated)
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/brains/:brain_id/reset — wipe a brain to a clean slate.
+//
+// Use cases:
+//   • Bench harness clearing state between questions (the original
+//     reason this exists — see `bench/longmemeval/smoke_one.py`).
+//   • A user choosing "start over" in the UI without rebuilding their
+//     vault from scratch.
+//   • Recovering from a corrupted brain by truncating + re-creating
+//     the vec0 virtual table.
+//
+// What gets cleared:
+//   • Every row in every engram-derived table (engrams, chunks, links,
+//     entities, themes, episodic_facts, retrieval_feedback, …).
+//   • The `vec_chunks` virtual table is DROPPED and re-created. This
+//     is the load-bearing step: a naive `DELETE FROM vec_chunks_chunks`
+//     from a Python sqlite3 connection (no vec0 extension loaded)
+//     leaves the rowids/info shadow tables out of sync with each
+//     other, and recall starts returning garbage. We do the drop +
+//     recreate from inside the server, where the vec0 extension is
+//     loaded, so the shadow tables are managed correctly.
+//   • Optional: `?vault=true` also deletes every `.md` file under the
+//     brain's vault dir. Off by default — most callers want a DB
+//     reset without nuking the markdown source-of-truth.
+//
+// What is preserved:
+//   • The brain's registry entry (id, name, description, vault_path
+//     override). The brain stays in the brains list; it's just empty.
+//   • `cluster_names.json` and other per-brain config files.
+//   • `vec_chunks_info` schema metadata — recreated to match the
+//     fresh table.
+//
+// Atomicity: the drop + truncate + recreate run inside a single
+// transaction. If any step fails, the brain is rolled back to its
+// pre-reset state. VACUUM runs after commit (SQLite forbids it
+// inside a transaction); a VACUUM failure leaves the file slightly
+// fatter than necessary but is not a correctness issue.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+pub struct ResetQuery {
+    /// When `true`, also delete `*.md` files under the brain's vault
+    /// directory. Default `false` — most callers want a DB reset that
+    /// preserves the markdown source-of-truth.
+    #[serde(default)]
+    vault: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct ResetResponse {
+    pub brain_id: String,
+    /// Number of engram rows that existed before the reset. Useful
+    /// for log lines and for the bench harness to confirm something
+    /// actually got cleared.
+    pub engrams_purged: i64,
+    /// Whether the vault dir's markdown files were deleted too.
+    pub vault_purged: bool,
+}
+
+/// Tables created by either `migrations::run_all` or `SCHEMA_SQL`
+/// that hold engram-derived rows. Listed explicitly (rather than
+/// discovered via `sqlite_master`) so we never accidentally truncate
+/// a future schema table we shouldn't touch. Keep this in sync with
+/// `schema.sql`'s `CREATE TABLE` list.
+///
+/// Order: engram-derived rows first, then `engrams` itself last so
+/// any future FK constraints fire in the right direction. We use
+/// `DELETE FROM` rather than `TRUNCATE` (which SQLite doesn't have)
+/// — `DELETE` without a WHERE clause is the SQLite-idiomatic full
+/// wipe and gets the same fast-path under the hood.
+const RESETTABLE_TABLES: &[&str] = &[
+    "chunks",
+    "engram_links",
+    "entity_mentions",
+    "entities",
+    "episodic_facts",
+    "temporal_facts",
+    "retrieval_feedback",
+    "query_affinity",
+    "edge_activity",
+    "theme_members",
+    "themes",
+    "core_memory_blocks",
+    "contradictions",
+    "engram_versions",
+    "compilations",
+    "drafts",
+    "draft_sections",
+    "function_calls",
+    "variable_references",
+    "variable_renames",
+    "variables",
+    "working_memory",
+    "memory_types",
+    // `engrams` last — any future FK on engram_id cascades cleanly.
+    "engrams",
+];
+
+// ---------------------------------------------------------------------------
+// Structured facts (Option D / Layer 2). The connected agent extracts a
+// fact from a note and records it via POST /api/facts; recall surfaces it
+// by EXACT subject-token match (retriever.rs), sidestepping the embedder
+// for fact-shaped queries ("what's my X / who owns Y"). Facts are a DERIVED
+// index over engrams (source_engram FK) — the markdown note stays the
+// source of truth and is never overwritten. Supersession: recording a new
+// value for an existing (subject, attribute) marks the prior one
+// superseded_by the new id, so "current value" stays unambiguous.
+// ---------------------------------------------------------------------------
+#[derive(Deserialize)]
+pub struct RecordFactBody {
+    pub subject: String,
+    #[serde(default)]
+    pub attribute: String,
+    pub value: String,
+    pub source_engram: String,
+    #[serde(default)]
+    pub brain_id: Option<String>,
+}
+
+pub async fn record_fact(
+    _s: State<ServerState>,
+    Json(body): Json<RecordFactBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(body.brain_id.as_deref())?;
+        let db = open_brain(&id)?;
+        let subject = body.subject.trim().to_lowercase();
+        let attribute = body.attribute.trim().to_lowercase();
+        let value = body.value.trim().to_string();
+        if subject.is_empty() || value.is_empty() {
+            return Ok(serde_json::json!({"ok": false, "error": "subject and value required"}));
+        }
+        // Supersession lives in `facts::upsert_fact`, shared with the
+        // auto-ingest write path so the two can never disagree about
+        // which value is current (they once did — in opposite
+        // directions — for a re-stated value).
+        let conn = db.lock();
+        let fid =
+            super::facts::upsert_fact(&conn, &subject, &attribute, &value, &body.source_engram)?;
+        Ok(serde_json::json!({"ok": true, "id": fid, "subject": subject, "value": value}))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct FactsQuery {
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub brain_id: Option<String>,
+    #[serde(default)]
+    pub include_superseded: Option<bool>,
+}
+
+pub async fn facts_list(
+    Query(q): Query<FactsQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(q.brain_id.as_deref())?;
+        let db = open_brain(&id)?;
+        let include_sup = q.include_superseded.unwrap_or(false);
+        let subj = q.subject.as_deref().map(|s| s.trim().to_lowercase());
+        let conn = db.lock();
+        let mut sql = String::from(
+            "SELECT subject, attribute, value, source_engram, (superseded_by IS NULL) FROM facts",
+        );
+        let mut clauses: Vec<&str> = Vec::new();
+        if !include_sup {
+            clauses.push("superseded_by IS NULL");
+        }
+        if subj.is_some() {
+            clauses.push("subject = ?1");
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        let to_json = |r: &rusqlite::Row| -> rusqlite::Result<serde_json::Value> {
+            Ok(serde_json::json!({
+                "subject": r.get::<_, String>(0)?,
+                "attribute": r.get::<_, String>(1)?,
+                "value": r.get::<_, String>(2)?,
+                "source_engram": r.get::<_, String>(3)?,
+                "current": r.get::<_, i64>(4)? == 1,
+            }))
+        };
+        let rows: Vec<serde_json::Value> = match &subj {
+            Some(s) => stmt
+                .query_map(rusqlite::params![s], to_json)?
+                .filter_map(Result::ok)
+                .collect(),
+            None => stmt
+                .query_map([], to_json)?
+                .filter_map(Result::ok)
+                .collect(),
+        };
+        Ok(serde_json::json!({"count": rows.len(), "facts": rows}))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+// GET /api/consolidate?limit=N — the write-time consolidation queue
+// (Option D). Returns engrams the agent hasn't fact-extracted yet
+// (derived: not the source_engram of any fact). The connected agent reads
+// these, extracts durable facts, and POSTs each via /api/facts. A note
+// that legitimately has no facts will reappear until a mark step is added
+// (MVP: every processed note gets >=1 fact, so the derive suffices).
+#[derive(Deserialize)]
+pub struct ConsolidateQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub brain_id: Option<String>,
+}
+
+pub async fn consolidate_queue(
+    Query(q): Query<ConsolidateQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(q.brain_id.as_deref())?;
+        let db = open_brain(&id)?;
+        let limit = q.limit.unwrap_or(10).min(50) as i64;
+        let conn = db.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, content FROM engrams \
+             WHERE state != 'dormant' \
+               AND COALESCE(kind, 'note') NOT IN ('preference') \
+               AND id NOT IN (SELECT DISTINCT source_engram FROM facts) \
+             ORDER BY COALESCE(created_at, '') DESC LIMIT ?1",
+        )?;
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map(rusqlite::params![limit], |r| {
+                let content: String = r.get::<_, String>(2)?;
+                Ok(serde_json::json!({
+                    "engram_id": r.get::<_, String>(0)?,
+                    "title": r.get::<_, String>(1)?,
+                    "content": content.chars().take(2000).collect::<String>(),
+                }))
+            })?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(serde_json::json!({"count": rows.len(), "notes": rows}))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+pub async fn brains_reset(
+    Path(brain_id): Path<String>,
+    Query(q): Query<ResetQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<ResetResponse>, ApiError> {
+    let purge_vault = q.vault.unwrap_or(false);
+    let result = tokio::task::spawn_blocking(move || -> Result<ResetResponse, MemoryError> {
+        let id = resolve_brain_id(Some(&brain_id))?;
+        let db = open_brain(&id)?;
+
+        // Count engrams before the wipe so the response is informative.
+        // Cheap O(1) query (SQLite has the table size in pragma data).
+        let count_before: i64 = {
+            let conn = db.lock();
+            conn.query_row("SELECT COUNT(*) FROM engrams", [], |r| r.get(0))
+                .unwrap_or(0)
+        };
+
+        // Drop+truncate+recreate happens inside one transaction. If
+        // any step fails the whole thing rolls back, leaving the
+        // brain in its pre-reset state. VACUUM has to run after the
+        // commit (SQLite forbids it inside a transaction).
+        {
+            let conn = db.lock();
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+
+            // 1. Drop vec_chunks. With the vec0 extension loaded
+            //    (it is — db::open_new calls sqlite_vec::load), DROP
+            //    TABLE invokes vec0's xDestroy hook, which cleans up
+            //    the shadow tables (vec_chunks_chunks, _rowids,
+            //    _vector_chunks00, _info) atomically.
+            if let Err(e) = conn.execute("DROP TABLE IF EXISTS vec_chunks", []) {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(MemoryError::Other(format!(
+                    "failed to drop vec_chunks: {}",
+                    e
+                )));
+            }
+
+            // 2. Truncate engram-derived rowsets. Missing tables are
+            //    tolerated (older brains may lack tables that newer
+            //    migrations would have added).
+            for table in RESETTABLE_TABLES {
+                if let Err(e) = conn.execute(&format!("DELETE FROM {}", table), []) {
+                    // Table not existing isn't an error — older brains
+                    // may not have every table. Anything else is.
+                    let msg = e.to_string().to_lowercase();
+                    if !msg.contains("no such table") {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(MemoryError::Other(format!(
+                            "failed to truncate {}: {}",
+                            table, e
+                        )));
+                    }
+                }
+            }
+
+            // 3. Recreate vec_chunks fresh, with the exact same
+            //    schema `db::ensure_vec_chunks` would create for a
+            //    new brain. Hardcoding the embedding dim here (384)
+            //    rather than re-importing `EMBEDDING_DIM` would
+            //    break the day someone bumps the model; pull from
+            //    the constant.
+            let create_stmt = format!(
+                "CREATE VIRTUAL TABLE vec_chunks USING vec0(chunk_id TEXT PRIMARY KEY, embedding float[{}])",
+                super::embedder::EMBEDDING_DIM,
+            );
+            if let Err(e) = conn.execute(&create_stmt, []) {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(MemoryError::Other(format!(
+                    "failed to recreate vec_chunks: {}",
+                    e
+                )));
+            }
+
+            conn.execute_batch("COMMIT")?;
+        }
+
+        // VACUUM reclaims pages freed by the truncate so the file
+        // doesn't keep its pre-reset size on disk. Outside the
+        // transaction (SQLite requirement). Failure here isn't
+        // fatal — the brain is correct, just slightly fatter than
+        // necessary; log and continue.
+        {
+            let conn = db.lock();
+            if let Err(e) = conn.execute("VACUUM", []) {
+                eprintln!("[brains_reset] VACUUM failed on {}: {} — continuing", id, e);
+            }
+        }
+
+        // Optional vault wipe — delete every `*.md` under the vault
+        // directory but leave the directory structure intact. We use
+        // the resolved vault path (which may be a user-configured
+        // external dir), not just `brain_dir/vault`.
+        let mut vault_purged = false;
+        if purge_vault {
+            let vault = super::read_ops::resolve_vault_path(&id)?;
+            if vault.exists() {
+                match walk_and_delete_md(&vault) {
+                    Ok(_) => vault_purged = true,
+                    Err(e) => {
+                        eprintln!(
+                            "[brains_reset] vault wipe failed on {}: {} — DB reset still succeeded",
+                            id, e
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(ResetResponse {
+            brain_id: id,
+            engrams_purged: count_before,
+            vault_purged,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+
+    Ok(Json(result))
+}
+
+/// Recursively delete every `*.md` file under `dir`, leaving the
+/// directory structure intact. Symlinks are not followed so a
+/// misconfigured vault_path can't escape into the user's home.
+fn walk_and_delete_md(dir: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let path = entry.path();
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            walk_and_delete_md(&path)?;
+        } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
+            // Best-effort delete — log and continue if one file is
+            // locked. The reset is still useful even if a couple of
+            // files survive.
+            if let Err(e) = std::fs::remove_file(&path) {
+                eprintln!("[brains_reset] could not delete {}: {}", path.display(), e);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct NotesListQuery {
+    /// Optional brain to scope to; None = active brain. Without this,
+    /// `?brain=` was silently ignored and every caller got the active
+    /// brain's notes — a scope leak the Home gallery's per-card
+    /// most-used hover tripped on (2026-07-12).
+    #[serde(default, alias = "brain")]
+    brain_id: Option<String>,
+}
+
+pub async fn notes_list(
+    Query(q): Query<NotesListQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<Vec<NoteListRow>>, ApiError> {
+    let id = resolve_brain_id(q.brain_id.as_deref())?;
+    let db = open_brain(&id)?;
+    Ok(Json(list_notes(&db)?))
+}
+
+pub async fn notes_detail(
+    Path(engram_id): Path<String>,
+    _s: State<ServerState>,
+) -> Result<Json<FullNote>, ApiError> {
+    let id = resolve_brain_id(None)?;
+    let db = open_brain(&id)?;
+    Ok(Json(get_note(&db, &engram_id)?))
+}
+
+#[derive(Deserialize)]
+pub struct GraphQuery {
+    #[serde(default)]
+    include_observations: Option<bool>,
+    #[serde(default)]
+    min_similarity: Option<f64>,
+    /// CSV of link_types to drop server-side (e.g. "semantic"). Missing /
+    /// empty = no filter. Lets a low-power view skip the semantic hairball.
+    #[serde(default)]
+    exclude_types: Option<String>,
+}
+
+pub async fn graph(
+    Query(q): Query<GraphQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<GraphData>, ApiError> {
+    let id = resolve_brain_id(None)?;
+    let db = open_brain(&id)?;
+    let exclude_types: Vec<String> = q
+        .exclude_types
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    Ok(Json(get_graph(
+        &db,
+        q.include_observations.unwrap_or(false),
+        // Bumped from 0.75 to 0.85 in v0.1.7. At 0.75 a typical brain
+        // ends up with 80+ edges per node (hairball) because most notes
+        // share enough vocabulary to score weakly similar to most other
+        // notes. 0.85 keeps the real semantic links and drops the
+        // noise — measured on NeuroVaultBrain1, edges drop from 11758
+        // to 2202 (avg 15/node, which actually reads as a graph).
+        q.min_similarity.unwrap_or(0.85),
+        &exclude_types,
+    )?))
+}
+
+#[derive(Deserialize)]
+pub struct RecallQuery {
+    q: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    mode: Option<String>,
+    #[serde(default)]
+    spread_hops: Option<u8>,
+    #[serde(default)]
+    as_of: Option<String>,
+    #[serde(default)]
+    include_observations: Option<bool>,
+    // Accept `brain` as well as `brain_id`: the MCP proxy/forwarder sends
+    // `brain` on GET /api/recall, so without this alias a per-call brain
+    // override was silently ignored (recall always used the active brain).
+    #[serde(default, alias = "brain")]
+    brain_id: Option<String>,
+    /// Comma-separated list of scoring features to disable. Used by
+    /// the eval harness to A/B-test which signals earn their weight.
+    /// Production callers never set this; the retriever defaults to
+    /// the full pipeline.
+    #[serde(default)]
+    ablate: Option<String>,
+    /// Cross-encoder reranker override for this call. Adds ~50-100 ms;
+    /// improves top-rank precision. When absent, the app preference
+    /// applies (`rerank_enabled()`: ON unless toggled off in Settings,
+    /// persisted at ~/.neurovault/rerank.txt).
+    #[serde(default)]
+    rerank: Option<bool>,
+    /// Skip the per-brain recall rate limiter for this call. Used by
+    /// AMBIENT consumers (the Claude Code auto-recall hook fires on
+    /// every prompt) so background recalls neither receive the
+    /// throttle-hint pseudo-hit nor consume the budget that teaches
+    /// AGENTS to pace their tool calls. Deliberately NOT exposed in
+    /// the MCP tools.json — agents keep the throttle.
+    #[serde(default)]
+    throttle: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct QuerySignalQuery {
+    q: String,
+    #[serde(default, alias = "brain")]
+    brain_id: Option<String>,
+}
+
+/// GET /api/query_signal — corpus-driven "is this query worth a
+/// retrieval?" statistics. For each query token (BM25 tokenizer, so
+/// index stopwords already dropped) returns its document frequency in
+/// the active brain plus the BM25-style IDF; `max_idf` is the single
+/// number ambient consumers gate on. Cheap: one in-memory map lookup
+/// per token, no embedding, no vector search.
+pub async fn query_signal(
+    Query(q): Query<QuerySignalQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(q.brain_id.as_deref())?;
+        let db = open_brain(&id)?;
+        let idx = super::bm25::index_for(&id);
+        if idx.size() == 0 {
+            idx.build(&db)?;
+        }
+        let (n, stats) = idx.query_signal(&q.q);
+        let nf = n as f64;
+        let idf = |df: u64| -> f64 {
+            if n == 0 {
+                return 0.0;
+            }
+            // Same shape as the BM25 scorer: ln((N - df + 0.5)/(df + 0.5) + 1).
+            ((nf - df as f64 + 0.5) / (df as f64 + 0.5) + 1.0).ln()
+        };
+        let tokens: Vec<serde_json::Value> = stats
+            .iter()
+            .map(|(t, df)| serde_json::json!({"token": t, "df": df, "idf": idf(*df)}))
+            .collect();
+        let max_idf = stats.iter().map(|(_, df)| idf(*df)).fold(0.0_f64, f64::max);
+        Ok(serde_json::json!({
+            "brain": id,
+            "n_docs": n,
+            "tokens": tokens,
+            "max_idf": max_idf,
+        }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct JournalEventsQuery {
+    #[serde(default, alias = "brain")]
+    brain_id: Option<String>,
+    /// Comma-separated event ids (bounded 50) — the Inspector's
+    /// experience-unit timeline fetch.
+    ids: String,
+    /// Days back to search (default 60).
+    #[serde(default)]
+    days: Option<i64>,
+}
+
+/// GET /api/journal_events?ids=a,b,c — resolve evidence ids into full
+/// events so the Proposal Inspector can render the unit timeline:
+/// intention → injected context → outcome.
+pub async fn journal_events_by_id(
+    Query(q): Query<JournalEventsQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(q.brain_id.as_deref())?;
+        let wanted: std::collections::HashSet<&str> = q
+            .ids
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .take(50)
+            .collect();
+        let now = time::OffsetDateTime::now_utc();
+        let start = now - time::Duration::days(q.days.unwrap_or(60).clamp(1, 365));
+        let events: Vec<_> = super::journal::read_window(&id, start, now, None)
+            .into_iter()
+            .filter(|e| wanted.contains(e.event_id.as_str()))
+            .collect();
+        Ok(serde_json::json!({ "brain": id, "count": events.len(), "events": events }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct FalseNegativeBody {
+    #[serde(default, alias = "brain")]
+    brain_id: Option<String>,
+    description: String,
+    #[serde(default)]
+    evidence: Vec<String>,
+    #[serde(default)]
+    reviewer: Option<String>,
+}
+
+/// POST /api/consolidation_false_negative — the human marks something
+/// consolidation SHOULD have proposed and didn't. Counted in metrics:
+/// impressive precision by proposing almost nothing is not success.
+pub async fn consolidation_false_negative(
+    _s: State<ServerState>,
+    Json(body): Json<FalseNegativeBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        if body.description.trim().len() < 4 {
+            return Err(MemoryError::Other("description required".into()));
+        }
+        let id = resolve_brain_id(body.brain_id.as_deref())?;
+        let mut ev =
+            super::journal::Event::now(&id, "consolidation_false_negative", "audit", "manual");
+        ev.actor = format!("user:{}", body.reviewer.as_deref().unwrap_or("user"));
+        ev.after = Some(body.description.trim().chars().take(300).collect());
+        ev.source_refs = body.evidence.clone();
+        ev.capture_method = "review".into();
+        crate::memory::journal::append(&ev)?;
+        Ok(serde_json::json!({ "brain": id, "event_id": ev.event_id }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct ProposalDecisionBody {
+    /// Required mutation scope. Review decisions must never fall back to the
+    /// process-global active brain: that can change after the card was loaded.
+    #[serde(alias = "brain")]
+    brain_id: String,
+    #[serde(default)]
+    reviewer: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    /// Field edits (name -> approved value); both values are retained.
+    #[serde(default)]
+    edits: std::collections::HashMap<String, String>,
+}
+
+fn proposal_decision_brain_id(body: &ProposalDecisionBody) -> Result<String, ApiError> {
+    let brain_id = body.brain_id.trim();
+    if brain_id.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "brain_id is required for proposal decisions".into(),
+        ));
+    }
+    resolve_brain_id(Some(brain_id)).map_err(ApiError::from)
+}
+
+/// POST /api/proposals/:id/approve — review decision as a journal
+/// event; idempotent under concurrent approvals; applies only the
+/// demonstrably safe classes (memory_strengthened, approved
+/// supersessions) and acknowledges the rest.
+pub async fn proposal_approve(
+    Path(pid): Path<String>,
+    _s: State<ServerState>,
+    Json(body): Json<ProposalDecisionBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = proposal_decision_brain_id(&body)?;
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let reviewer = body.reviewer.as_deref().unwrap_or("user");
+        let (mut rec, changed) = super::adaptive::proposals::decide(
+            &id,
+            &pid,
+            true,
+            &body.edits,
+            reviewer,
+            body.reason.as_deref(),
+        )?;
+        // APPLICATION is a separate axis from REVIEW: an executor
+        // failure lands in application_status/Failed and never rewrites
+        // the human's verdict. Only demonstrably safe classes execute;
+        // the rest stay Pending until their executor (or evidence)
+        // exists.
+        use super::adaptive::proposals::{set_application, ApplicationStatus};
+        if changed {
+            let outcome: std::result::Result<Option<&str>, String> = match rec.action.as_str() {
+                "memory_strengthened" => {
+                    let db = open_brain(&id)?;
+                    let conn = db.lock();
+                    match conn.execute(
+                        "UPDATE engrams SET last_confirmed_at = datetime('now') WHERE id = ?1",
+                        rusqlite::params![rec.object_id],
+                    ) {
+                        Ok(n) if n > 0 => Ok(Some("last_confirmed_at refreshed")),
+                        Ok(_) => Err("engram not found to strengthen".into()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                "supersession_suggestion" => {
+                    let field = |name: &str| {
+                        rec.fields
+                            .iter()
+                            .find(|f| f.name == name)
+                            .map(|f| f.approved_value.clone().unwrap_or(f.proposed_value.clone()))
+                    };
+                    match (field("superseded_engram"), field("superseded_by")) {
+                        (Some(older), Some(newer)) => {
+                            let db = open_brain(&id)?;
+                            let reason =
+                                format!("approved consolidation proposal {}", rec.proposal_id);
+                            match super::write_ops::supersede_note(
+                                &db,
+                                &older,
+                                &newer,
+                                Some(&reason),
+                            ) {
+                                Ok(true) => Ok(Some("note superseded")),
+                                Ok(false) => Err("engram not found to supersede".into()),
+                                Err(e) => Err(e.to_string()),
+                            }
+                        }
+                        _ => Err("missing supersession fields".into()),
+                    }
+                }
+                // No executor yet: approved but application stays
+                // Pending (working_state_refresh awaits the hardened
+                // transcript reader; room summaries await their
+                // summariser).
+                _ => Ok(None),
+            };
+            rec = match outcome {
+                Ok(Some(_)) => {
+                    set_application(&id, &rec.proposal_id, ApplicationStatus::Applied, None)?
+                }
+                Ok(None) => rec, // stays Pending
+                Err(e) => {
+                    set_application(&id, &rec.proposal_id, ApplicationStatus::Failed, Some(&e))?
+                }
+            };
+        }
+        let applied_note = format!(
+            "{:?}{}",
+            rec.application_status,
+            rec.application_error
+                .as_deref()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default()
+        );
+        Ok(serde_json::json!({
+            "brain": id,
+            "proposal": rec,
+            "changed": changed,
+            "apply": applied_note,
+        }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+/// POST /api/proposals/:id/reject
+pub async fn proposal_reject(
+    Path(pid): Path<String>,
+    _s: State<ServerState>,
+    Json(body): Json<ProposalDecisionBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = proposal_decision_brain_id(&body)?;
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let reviewer = body.reviewer.as_deref().unwrap_or("user");
+        let (rec, changed) = super::adaptive::proposals::decide(
+            &id,
+            &pid,
+            false,
+            &std::collections::HashMap::new(),
+            reviewer,
+            body.reason.as_deref(),
+        )?;
+        Ok(serde_json::json!({ "brain": id, "proposal": rec, "changed": changed }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+#[cfg(test)]
+mod proposal_decision_scope_tests {
+    use super::*;
+
+    #[test]
+    fn proposal_decisions_require_an_explicit_non_empty_brain() {
+        let missing = serde_json::from_value::<ProposalDecisionBody>(serde_json::json!({
+            "reviewer": "user"
+        }));
+        assert!(
+            missing.is_err(),
+            "missing brain_id must not fall back to active"
+        );
+
+        let empty = serde_json::from_value::<ProposalDecisionBody>(serde_json::json!({
+            "brain_id": "   ",
+            "reviewer": "user"
+        }))
+        .unwrap();
+        let err = proposal_decision_brain_id(&empty).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let legacy_alias = serde_json::from_value::<ProposalDecisionBody>(serde_json::json!({
+            "brain": "vault-a",
+            "reviewer": "user"
+        }))
+        .unwrap();
+        assert_eq!(legacy_alias.brain_id, "vault-a");
+    }
+}
+
+/// GET /api/proposals?brain=&status= — the Inspector's review queue.
+pub async fn proposals_list(
+    Query(q): Query<AmbientLogQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(q.brain_id.as_deref())?;
+        let all = super::adaptive::proposals::load_all(&id);
+        let mut list: Vec<_> = all
+            .into_values()
+            .filter(|p| {
+                q.decision.as_deref().is_none_or(|want| {
+                    format!("{:?}", p.review_status).eq_ignore_ascii_case(&want.replace('_', ""))
+                })
+            })
+            .collect();
+        list.sort_by(|a, b| b.proposed_at.cmp(&a.proposed_at));
+        list.truncate(q.limit.unwrap_or(100).min(500));
+        Ok(serde_json::json!({ "brain": id, "count": list.len(), "proposals": list }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+/// GET /api/consolidation_metrics — review quality beyond approval
+/// rate (untouched vs edited approvals, field edit rate, per-type and
+/// per-band precision, unreviewed backlog, audited false negatives).
+pub async fn consolidation_metrics(
+    Query(q): Query<AmbientLogQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(q.brain_id.as_deref())?;
+        let m = super::adaptive::proposals::metrics(&id);
+        serde_json::to_value(&m).map_err(|e| MemoryError::Other(e.to_string()))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct ConsolidateBody {
+    #[serde(default, alias = "brain")]
+    brain_id: Option<String>,
+    #[serde(default)]
+    room: Option<String>,
+    /// Window to consolidate, in hours back from now (default 24).
+    #[serde(default)]
+    window_hours: Option<i64>,
+    /// "shadow" (default) or "proposal" (stage 2: proposals enter the
+    /// review store; watermark advances).
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+/// POST /api/consolidate — SHADOW mode (stage 1): reads experience
+/// units from the journal, returns a deterministic report with
+/// evidence-cited proposals, writes NOTHING to memories. The report
+/// also lands in logs/consolidation_reports.jsonl for the Inspector.
+pub async fn consolidate_shadow(
+    _s: State<ServerState>,
+    Json(body): Json<ConsolidateBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Resolved out here so the error mapper can recognise this brain's
+    // own single-flight refusal.
+    let id = resolve_brain_id(body.brain_id.as_deref()).map_err(ApiError::from)?;
+    let brain = id.clone();
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let scope = scope_for(&id, body.room.as_deref());
+        let now = time::OffsetDateTime::now_utc();
+        let hours = body.window_hours.unwrap_or(24).clamp(1, 24 * 90);
+        let report = if body.mode.as_deref() == Some("proposal") {
+            super::adaptive::consolidate::run_proposal(&scope)?
+        } else {
+            super::adaptive::consolidate::run_shadow(
+                &scope,
+                now - time::Duration::hours(hours),
+                now,
+            )?
+        };
+        serde_json::to_value(&report).map_err(|e| MemoryError::Other(e.to_string()))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| single_flight_aware(&brain, e))?;
+    Ok(Json(out))
+}
+
+/// Losing the per-brain single-flight lock is a 409, not a 500.
+///
+/// `run_proposal` flattens `BrainRunBusy` into `MemoryError::Other`
+/// before it reaches here, so the busy case surfaced as "internal server
+/// error" — wrong in general, and actively misleading now that the
+/// curator's manual-run button can legitimately collide with the
+/// nightly clock. The comparison is against the lock type's own
+/// `Display` for this exact brain, not a copied string literal, so the
+/// message and the mapping cannot drift apart.
+fn single_flight_aware(brain_id: &str, e: MemoryError) -> ApiError {
+    let text = e.to_string();
+    let busy = super::adaptive::lock::BrainRunBusy {
+        brain_id: brain_id.to_string(),
+    }
+    .to_string();
+    if text == busy {
+        ApiError(StatusCode::CONFLICT, text)
+    } else {
+        ApiError::from(e)
+    }
+}
+
+/// GET /api/consolidation_reports — the Inspector's consolidation feed.
+pub async fn consolidation_reports(
+    Query(q): Query<AmbientLogQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let limit = q.limit.unwrap_or(20).min(200);
+        let path = super::paths::nv_home()
+            .join("logs")
+            .join("consolidation_reports.jsonl");
+        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        let records: Vec<serde_json::Value> = raw
+            .lines()
+            .rev()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|r: &serde_json::Value| {
+                q.brain_id
+                    .as_deref()
+                    .is_none_or(|b| r["brain"].as_str() == Some(b))
+            })
+            .take(limit)
+            .collect();
+        Ok(serde_json::json!({ "count": records.len(), "records": records }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct JournalEventBody {
+    #[serde(default, alias = "brain")]
+    brain_id: Option<String>,
+    event_type: String,
+    #[serde(default)]
+    object_type: Option<String>,
+    #[serde(default)]
+    object_id: Option<String>,
+    #[serde(default)]
+    room: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    actor: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    before: Option<String>,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    source_refs: Vec<String>,
+    /// Untrusted host input. Malformed/unknown evidence becomes a safe
+    /// `InvalidInput` receipt, so it never suppresses the primary
+    /// outcome event or disappears invisibly.
+    #[serde(default, deserialize_with = "deserialize_optional_evidence_input")]
+    evidence_input: EvidenceInputField,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    capture_method: Option<String>,
+}
+
+#[derive(Debug, Default)]
+enum EvidenceInputField {
+    #[default]
+    Absent,
+    Valid(super::adaptive::curator::evidence::OutcomeEvidenceInput),
+    Invalid,
+}
+
+fn deserialize_optional_evidence_input<'de, D>(
+    deserializer: D,
+) -> Result<EvidenceInputField, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(value) => serde_json::from_value(value)
+            .map(EvidenceInputField::Valid)
+            .unwrap_or(EvidenceInputField::Invalid),
+        // Missing fields use `Default::default` and never enter this
+        // function, so an explicit null is an attempted invalid input.
+        None => EvidenceInputField::Invalid,
+    })
+}
+
+fn is_outcome_event(event_type: &str) -> bool {
+    matches!(event_type, "assistant_response_completed" | "session_ended")
+}
+
+fn looks_like_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let windows_drive_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    std::path::Path::new(value).is_absolute()
+        || value
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://"))
+        || value.starts_with("\\\\")
+        || value.starts_with("//")
+        || windows_drive_absolute
+}
+
+/// Remove the two raw-path fields emitted by older hooks. Preserve
+/// semantic and causal references, and retain only a bounded project
+/// basename as the human-readable title.
+fn sanitize_legacy_outcome_fields(event: &mut super::journal::Event) {
+    if !is_outcome_event(&event.event_type) {
+        return;
+    }
+    event
+        .source_refs
+        .retain(|reference| !looks_like_absolute_path(reference));
+    let legacy_cwd = event
+        .after
+        .as_deref()
+        .and_then(|value| value.strip_prefix("cwd: "));
+    if let Some(cwd) = legacy_cwd {
+        if event.title.is_none() {
+            event.title = cwd
+                .rsplit(['/', '\\'])
+                .find(|part| !part.is_empty())
+                .map(|part| super::hooks::sanitize(part, 80));
+        }
+        event.after = None;
+    }
+}
+
+/// POST /api/journal_event — the outcome-capture channel (adaptive
+/// spec §12b). Thin hosts (hooks, IDE adapters) report normalized
+/// experience events; the server stamps identity and appends to the
+/// immutable journal. Idempotent when the caller supplies a key
+/// (repeated hook deliveries are one occurrence).
+pub async fn journal_event(
+    _s: State<ServerState>,
+    Json(body): Json<JournalEventBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        if body.event_type.trim().is_empty() {
+            return Err(MemoryError::Other("event_type required".into()));
+        }
+        let id = resolve_brain_id(body.brain_id.as_deref())?;
+        let mut ev = super::journal::Event::now(
+            &id,
+            body.event_type.trim(),
+            body.object_type.as_deref().unwrap_or("session"),
+            body.object_id
+                .as_deref()
+                .or(body.session_id.as_deref())
+                .unwrap_or("unknown"),
+        );
+        ev.room = body.room.clone();
+        ev.session_id = body.session_id.clone();
+        ev.host = body.host.clone();
+        if let Some(a) = &body.actor {
+            ev.actor = a.clone();
+        }
+        ev.title = body.title.clone();
+        ev.before = body.before.clone();
+        ev.after = body.after.clone();
+        ev.source_refs = body.source_refs.clone();
+        ev.idempotency_key = body.idempotency_key.clone();
+        ev.capture_method = body
+            .capture_method
+            .clone()
+            .unwrap_or_else(|| "endpoint".into());
+        sanitize_legacy_outcome_fields(&mut ev);
+        // Causal turn stamping: outcome events reference the
+        // context_decision that opened their turn — resolved by
+        // explicit session identity, never wall-clock adjacency
+        // (interleaved sessions destroy timestamp grouping).
+        if ev.turn_id.is_none() && ev.event_type != "context_decision" {
+            if let Some(sid) = ev.session_id.clone() {
+                if let Some(opened) =
+                    super::journal::latest_for_session(&id, &sid, "context_decision")
+                {
+                    ev.turn_id = opened.turn_id.clone();
+                    if is_outcome_event(&ev.event_type) {
+                        // The opening turn is server-recorded scope.
+                        // Request fields are transport hints and cannot
+                        // widen a private room or claim another host.
+                        ev.room = opened.room.clone();
+                        ev.privacy_label = opened.privacy_label.clone();
+                        ev.host = opened.host.clone();
+                    } else {
+                        if ev.room.is_none() {
+                            ev.room = opened.room.clone();
+                        }
+                        if ev.privacy_label.is_none() {
+                            ev.privacy_label = opened.privacy_label.clone();
+                        }
+                    }
+                    ev.source_refs
+                        .push(format!("caused_by:{}", opened.event_id));
+                }
+            }
+        }
+        // The privacy decision is authoritative and must happen before
+        // any transcript filesystem operation.
+        if super::journal::is_private_event(&ev) {
+            return Ok(serde_json::json!({
+                "brain": id,
+                "event_id": ev.event_id,
+                "written": false,
+                "evidence_capture": null,
+            }));
+        }
+        // Immutable redeliveries cannot be enriched. Avoid opening and
+        // hashing their evidence again; append_idempotent repeats the
+        // check under its lock to close the concurrent race.
+        if super::journal::already_recorded(&ev) {
+            return Ok(serde_json::json!({
+                "brain": id,
+                "event_id": ev.event_id,
+                "written": false,
+                "evidence_capture": null,
+            }));
+        }
+        let capture_receipt = match &body.evidence_input {
+            EvidenceInputField::Absent => None,
+            EvidenceInputField::Invalid => {
+                let receipt = super::journal::EvidenceCaptureReceipt {
+                    status: super::journal::EvidenceCaptureStatus::Ineligible,
+                    code: Some(super::journal::EvidenceCaptureCode::InvalidInput),
+                };
+                ev.evidence_capture = Some(receipt.clone());
+                Some(receipt)
+            }
+            EvidenceInputField::Valid(input) => {
+                let result = super::adaptive::curator::evidence::capture_outcome_evidence(
+                    input,
+                    super::adaptive::curator::evidence::CaptureContext {
+                        event_type: &ev.event_type,
+                        host: ev.host.as_deref(),
+                        session_id: ev.session_id.as_deref(),
+                        turn_id: ev.turn_id.as_deref(),
+                        room: ev.room.as_deref(),
+                        privacy_label: ev.privacy_label.as_deref(),
+                    },
+                );
+                if let Some(reference) = result.reference {
+                    ev.evidence_refs.push(reference);
+                }
+                ev.evidence_capture = Some(result.receipt.clone());
+                Some(result.receipt)
+            }
+        };
+        let written = super::journal::append_idempotent(&ev)?;
+        Ok(serde_json::json!({
+            "brain": id,
+            "event_id": ev.event_id,
+            "written": written,
+            // Safe status only: never echo the submitted path, digest,
+            // or transcript bytes from this endpoint.
+            "evidence_capture": if written { capture_receipt } else { None },
+        }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+#[cfg(test)]
+mod journal_event_capture_tests {
+    use super::*;
+
+    fn open_turn(brain: &str, session: &str, room: &str) {
+        let mut turn = super::super::journal::Event::now(
+            brain,
+            "context_decision",
+            "prompt",
+            &format!("prompt-{session}"),
+        );
+        turn.session_id = Some(session.into());
+        turn.turn_id = Some(turn.event_id.clone());
+        turn.room = Some(room.into());
+        turn.host = Some("claude_code".into());
+        super::super::journal::append(&turn).unwrap();
+    }
+
+    fn journal_text(home: &std::path::Path, brain: &str) -> String {
+        let dir = home.join("brains").join(brain).join("journal");
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[cfg(unix)]
+    struct ScopedCaptureEnvironment {
+        root: std::path::PathBuf,
+        previous_nv_home: Option<std::ffi::OsString>,
+        previous_claude_config_dir: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl ScopedCaptureEnvironment {
+        fn install(
+            root: std::path::PathBuf,
+            home: &std::path::Path,
+            claude_config_dir: &std::path::Path,
+        ) -> Self {
+            let previous_nv_home = std::env::var_os("NEUROVAULT_HOME");
+            let previous_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+            std::env::set_var("NEUROVAULT_HOME", home);
+            std::env::set_var("CLAUDE_CONFIG_DIR", claude_config_dir);
+            Self {
+                root,
+                previous_nv_home,
+                previous_claude_config_dir,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ScopedCaptureEnvironment {
+        fn drop(&mut self) {
+            match &self.previous_claude_config_dir {
+                Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            }
+            match &self.previous_nv_home {
+                Some(value) => std::env::set_var("NEUROVAULT_HOME", value),
+                None => std::env::remove_var("NEUROVAULT_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn evidence_input_is_typed_but_malformed_values_fail_open() {
+        let valid: JournalEventBody = serde_json::from_value(serde_json::json!({
+            "event_type": "assistant_response_completed",
+            "evidence_input": {
+                "kind": "transcript",
+                "absolute_path": "/tmp/s-1.jsonl",
+                "observed_prefix_len": 12,
+                "caller_supplied_digest_is_ignored": "untrusted"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            valid.evidence_input,
+            EvidenceInputField::Valid(
+                super::super::adaptive::curator::evidence::OutcomeEvidenceInput::Transcript {
+                    observed_prefix_len: 12,
+                    ..
+                }
+            )
+        ));
+
+        let unknown: JournalEventBody = serde_json::from_value(serde_json::json!({
+            "event_type": "assistant_response_completed",
+            "evidence_input": { "kind": "future_untrusted_shape", "path": "/secret" }
+        }))
+        .unwrap();
+        assert!(matches!(
+            unknown.evidence_input,
+            EvidenceInputField::Invalid
+        ));
+
+        let malformed: JournalEventBody = serde_json::from_value(serde_json::json!({
+            "event_type": "assistant_response_completed",
+            "evidence_input": "not an object"
+        }))
+        .unwrap();
+        assert!(matches!(
+            malformed.evidence_input,
+            EvidenceInputField::Invalid
+        ));
+
+        let absent: JournalEventBody = serde_json::from_value(serde_json::json!({
+            "event_type": "assistant_response_completed"
+        }))
+        .unwrap();
+        assert!(matches!(absent.evidence_input, EvidenceInputField::Absent));
+
+        let explicit_null: JournalEventBody = serde_json::from_value(serde_json::json!({
+            "event_type": "assistant_response_completed",
+            "evidence_input": null
+        }))
+        .unwrap();
+        assert!(matches!(
+            explicit_null.evidence_input,
+            EvidenceInputField::Invalid
+        ));
+    }
+
+    #[test]
+    fn legacy_outcomes_drop_raw_paths_but_keep_causal_references() {
+        let mut event = super::super::journal::Event::now(
+            "brain",
+            "assistant_response_completed",
+            "session",
+            "s-1",
+        );
+        event.source_refs = vec![
+            "/Users/alex/.claude/projects/p/s-1.jsonl".into(),
+            r"C:\Users\alex\.claude\projects\p\s-1.jsonl".into(),
+            "D:/Users/alex/.claude/projects/p/s-1.jsonl".into(),
+            "file:///Users/alex/.claude/projects/p/s-1.jsonl".into(),
+            "caused_by:turn-1".into(),
+            "x:custom-ref".into(),
+            "engram-1".into(),
+        ];
+        event.after = Some("cwd: /Users/alex/NeuroVault".into());
+        sanitize_legacy_outcome_fields(&mut event);
+
+        assert_eq!(event.title.as_deref(), Some("NeuroVault"));
+        assert_eq!(event.after, None);
+        assert_eq!(
+            event.source_refs,
+            vec!["caused_by:turn-1", "x:custom-ref", "engram-1"]
+        );
+    }
+
+    #[test]
+    fn non_outcome_events_are_not_reinterpreted() {
+        let mut event =
+            super::super::journal::Event::now("brain", "note_created", "engram", "note.md");
+        event.source_refs = vec!["/explicit/user/reference".into()];
+        event.after = Some("cwd: literal note content".into());
+        sanitize_legacy_outcome_fields(&mut event);
+        assert_eq!(event.source_refs, vec!["/explicit/user/reference"]);
+        assert_eq!(event.after.as_deref(), Some("cwd: literal note content"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn consent_flip_cannot_enrich_an_idempotent_outcome_redelivery() {
+        let _guard = super::super::journal::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let requested = std::env::temp_dir().join(format!(
+                "nv-handler-consent-redelivery-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&requested).unwrap();
+            let root = std::fs::canonicalize(requested).unwrap();
+            let home = root.join("nv-home");
+            let claude = root.join("claude");
+            let project = claude.join("projects").join("project-a");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            let _environment = ScopedCaptureEnvironment::install(root, &home, &claude);
+
+            std::fs::write(
+                home.join("local_curator.json"),
+                r#"{"enabled":false,"transcript_access":true}"#,
+            )
+            .unwrap();
+            let brain = "capture-consent-redelivery";
+            let session = "s-consent";
+            open_turn(brain, session, "project-a");
+            let transcript = project.join(format!("{session}.jsonl"));
+            let transcript_bytes = b"eligible-after-consent";
+            std::fs::write(&transcript, transcript_bytes).unwrap();
+            let body_json = serde_json::json!({
+                "brain_id": brain,
+                "event_type": "assistant_response_completed",
+                "object_type": "session",
+                "object_id": session,
+                "session_id": session,
+                "host": "claude_code",
+                "evidence_input": {
+                    "kind": "transcript",
+                    "absolute_path": transcript.to_string_lossy(),
+                    "observed_prefix_len": transcript_bytes.len(),
+                },
+                "idempotency_key": format!("stop-{session}-{}", transcript_bytes.len()),
+                "capture_method": "hook",
+            });
+
+            let first_body: JournalEventBody = serde_json::from_value(body_json.clone()).unwrap();
+            let Json(first) = journal_event(State(ServerState {}), Json(first_body))
+                .await
+                .unwrap();
+            assert_eq!(first["written"], true);
+            assert_eq!(first["evidence_capture"]["status"], "disabled");
+            assert_eq!(first["evidence_capture"]["code"], "curator_disabled");
+
+            std::fs::write(
+                home.join("local_curator.json"),
+                r#"{"enabled":true,"transcript_access":true}"#,
+            )
+            .unwrap();
+            let redelivery_body: JournalEventBody = serde_json::from_value(body_json).unwrap();
+            let Json(redelivery) = journal_event(State(ServerState {}), Json(redelivery_body))
+                .await
+                .unwrap();
+            assert_eq!(redelivery["written"], false);
+            assert!(redelivery["evidence_capture"].is_null());
+
+            let now = time::OffsetDateTime::now_utc();
+            let outcomes: Vec<_> = super::super::journal::read_window(
+                brain,
+                now - time::Duration::hours(1),
+                now + time::Duration::minutes(1),
+                None,
+            )
+            .into_iter()
+            .filter(|event| event.event_type == "assistant_response_completed")
+            .collect();
+            assert_eq!(outcomes.len(), 1, "redelivery must not append or enrich");
+            let outcome = &outcomes[0];
+            assert!(outcome.evidence_refs.is_empty());
+            assert_eq!(
+                outcome.evidence_capture,
+                Some(super::super::journal::EvidenceCaptureReceipt {
+                    status: super::super::journal::EvidenceCaptureStatus::Disabled,
+                    code: Some(super::super::journal::EvidenceCaptureCode::CuratorDisabled),
+                })
+            );
+            let raw = journal_text(&home, brain);
+            assert!(!raw.contains(transcript.to_string_lossy().as_ref()));
+            assert!(!raw.contains(std::str::from_utf8(transcript_bytes).unwrap()));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_approved_transcript_persists_source_unavailable_without_path_leakage() {
+        let _guard = super::super::journal::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let requested = std::env::temp_dir().join(format!(
+                "nv-handler-source-unavailable-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&requested).unwrap();
+            let root = std::fs::canonicalize(requested).unwrap();
+            let home = root.join("nv-home");
+            let claude = root.join("claude");
+            let project = claude.join("projects").join("project-a");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            let _environment = ScopedCaptureEnvironment::install(root, &home, &claude);
+            std::fs::write(
+                home.join("local_curator.json"),
+                r#"{"enabled":true,"transcript_access":true}"#,
+            )
+            .unwrap();
+
+            let brain = "capture-source-unavailable";
+            let session = "s-missing";
+            open_turn(brain, session, "project-a");
+            let missing = project.join(format!("{session}.jsonl"));
+            let body: JournalEventBody = serde_json::from_value(serde_json::json!({
+                "brain_id": brain,
+                "event_type": "assistant_response_completed",
+                "object_type": "session",
+                "object_id": session,
+                "session_id": session,
+                "host": "claude_code",
+                "evidence_input": {
+                    "kind": "transcript",
+                    "absolute_path": missing.to_string_lossy(),
+                    "observed_prefix_len": 1,
+                },
+                "idempotency_key": format!("stop-{session}-1"),
+                "capture_method": "hook",
+            }))
+            .unwrap();
+            let Json(response) = journal_event(State(ServerState {}), Json(body))
+                .await
+                .unwrap();
+            assert_eq!(response["written"], true);
+            assert_eq!(response["evidence_capture"]["status"], "ineligible");
+            assert_eq!(response["evidence_capture"]["code"], "source_unavailable");
+            assert!(!response
+                .to_string()
+                .contains(missing.to_string_lossy().as_ref()));
+
+            let now = time::OffsetDateTime::now_utc();
+            let outcomes: Vec<_> = super::super::journal::read_window(
+                brain,
+                now - time::Duration::hours(1),
+                now + time::Duration::minutes(1),
+                None,
+            )
+            .into_iter()
+            .filter(|event| event.event_type == "assistant_response_completed")
+            .collect();
+            assert_eq!(outcomes.len(), 1);
+            let outcome = &outcomes[0];
+            assert!(outcome.evidence_refs.is_empty());
+            assert_eq!(
+                outcome.evidence_capture,
+                Some(super::super::journal::EvidenceCaptureReceipt {
+                    status: super::super::journal::EvidenceCaptureStatus::Ineligible,
+                    code: Some(super::super::journal::EvidenceCaptureCode::SourceUnavailable),
+                })
+            );
+            assert!(!journal_text(&home, brain).contains(missing.to_string_lossy().as_ref()));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_claude_config_root_captures_through_the_public_handler() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = super::super::journal::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let requested = std::env::temp_dir().join(format!(
+                "nv-handler-symlinked-root-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&requested).unwrap();
+            let root = std::fs::canonicalize(requested).unwrap();
+            let home = root.join("nv-home");
+            let real_claude = root.join("real-claude");
+            let linked_claude = root.join("linked-claude");
+            let real_project = real_claude.join("projects").join("project-a");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&real_project).unwrap();
+            symlink(&real_claude, &linked_claude).unwrap();
+            let _environment = ScopedCaptureEnvironment::install(root, &home, &linked_claude);
+            std::fs::write(
+                home.join("local_curator.json"),
+                r#"{"enabled":true,"transcript_access":true}"#,
+            )
+            .unwrap();
+
+            let brain = "capture-symlinked-root";
+            let session = "s-linked-root";
+            open_turn(brain, session, "project-a");
+            let transcript = linked_claude
+                .join("projects")
+                .join("project-a")
+                .join(format!("{session}.jsonl"));
+            let transcript_bytes = b"symlinked-root-evidence";
+            std::fs::write(&transcript, transcript_bytes).unwrap();
+            let body: JournalEventBody = serde_json::from_value(serde_json::json!({
+                "brain_id": brain,
+                "event_type": "assistant_response_completed",
+                "object_type": "session",
+                "object_id": session,
+                "session_id": session,
+                "host": "claude_code",
+                "evidence_input": {
+                    "kind": "transcript",
+                    "absolute_path": transcript.to_string_lossy(),
+                    "observed_prefix_len": transcript_bytes.len(),
+                },
+                "idempotency_key": format!("stop-{session}-{}", transcript_bytes.len()),
+                "capture_method": "hook",
+            }))
+            .unwrap();
+            let Json(response) = journal_event(State(ServerState {}), Json(body))
+                .await
+                .unwrap();
+            assert_eq!(response["written"], true);
+            assert_eq!(response["evidence_capture"]["status"], "captured");
+
+            let now = time::OffsetDateTime::now_utc();
+            let outcome = super::super::journal::read_window(
+                brain,
+                now - time::Duration::hours(1),
+                now + time::Duration::minutes(1),
+                None,
+            )
+            .into_iter()
+            .find(|event| event.event_type == "assistant_response_completed")
+            .unwrap();
+            assert_eq!(outcome.evidence_refs.len(), 1);
+            assert!(matches!(
+                &outcome.evidence_refs[0],
+                super::super::journal::EvidenceReference::Transcript {
+                    root: super::super::journal::ApprovedTranscriptRoot::ClaudeProjects,
+                    relative_path,
+                    observed_prefix_len,
+                    ..
+                } if relative_path == &format!("project-a/{session}.jsonl")
+                    && *observed_prefix_len == transcript_bytes.len() as u64
+            ));
+            let raw = journal_text(&home, brain);
+            assert!(!raw.contains(linked_claude.to_string_lossy().as_ref()));
+            assert!(!raw.contains(real_claude.to_string_lossy().as_ref()));
+            assert!(!raw.contains(std::str::from_utf8(transcript_bytes).unwrap()));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outcome_capture_is_fail_open_private_safe_and_idempotent_end_to_end() {
+        let _guard = super::super::journal::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let requested = std::env::temp_dir().join(format!(
+                "nv-handler-evidence-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&requested).unwrap();
+            let root = std::fs::canonicalize(requested).unwrap();
+            let home = root.join("nv-home");
+            let claude = root.join("claude");
+            let project = claude.join("projects").join("project-a");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                home.join("local_curator.json"),
+                r#"{"enabled":true,"transcript_access":true}"#,
+            )
+            .unwrap();
+            std::env::set_var("NEUROVAULT_HOME", &home);
+            std::env::set_var("CLAUDE_CONFIG_DIR", &claude);
+
+            let brain = "capture-e2e";
+            open_turn(brain, "s-1", "project-a");
+            let transcript = project.join("s-1.jsonl");
+            let transcript_bytes = b"private-transcript-sentinel";
+            std::fs::write(&transcript, transcript_bytes).unwrap();
+            let body_json = serde_json::json!({
+                "brain_id": brain,
+                "event_type": "assistant_response_completed",
+                "object_type": "session",
+                "object_id": "s-1",
+                "session_id": "s-1",
+                "host": "spoofed-host",
+                "room": "spoofed-public-room",
+                "actor": "agent:claude-code",
+                "after": format!("cwd: {}", project.display()),
+                "source_refs": [transcript.to_string_lossy()],
+                "evidence_input": {
+                    "kind": "transcript",
+                    "absolute_path": transcript.to_string_lossy(),
+                    "observed_prefix_len": transcript_bytes.len(),
+                },
+                "idempotency_key": format!("stop-s-1-{}", transcript_bytes.len()),
+                "capture_method": "hook",
+            });
+            let first_body: JournalEventBody = serde_json::from_value(body_json.clone()).unwrap();
+            let Json(first) = journal_event(State(ServerState {}), Json(first_body))
+                .await
+                .unwrap();
+            assert_eq!(first["written"], true);
+            assert_eq!(first["evidence_capture"]["status"], "captured");
+
+            let now = time::OffsetDateTime::now_utc();
+            let events = super::super::journal::read_window(
+                brain,
+                now - time::Duration::hours(1),
+                now,
+                None,
+            );
+            let outcome = events
+                .iter()
+                .find(|event| event.event_type == "assistant_response_completed")
+                .unwrap();
+            assert_eq!(outcome.evidence_refs.len(), 1);
+            assert_eq!(outcome.host.as_deref(), Some("claude_code"));
+            assert_eq!(outcome.room.as_deref(), Some("project-a"));
+            assert!(outcome
+                .source_refs
+                .iter()
+                .all(|reference| { !reference.contains(transcript.to_string_lossy().as_ref()) }));
+            assert!(outcome.after.is_none());
+
+            let raw = journal_text(&home, brain);
+            assert!(!raw.contains(transcript.to_string_lossy().as_ref()));
+            assert!(!raw.contains(std::str::from_utf8(transcript_bytes).unwrap()));
+            assert!(!raw.contains(project.to_string_lossy().as_ref()));
+
+            // A duplicate is recognized before evidence access. Removing
+            // the source proves the second delivery does not reopen it.
+            std::fs::remove_file(&transcript).unwrap();
+            let second_body: JournalEventBody = serde_json::from_value(body_json).unwrap();
+            let Json(second) = journal_event(State(ServerState {}), Json(second_body))
+                .await
+                .unwrap();
+            assert_eq!(second["written"], false);
+            let events_after = super::super::journal::read_window(
+                brain,
+                now - time::Duration::hours(1),
+                time::OffsetDateTime::now_utc(),
+                None,
+            );
+            assert_eq!(
+                events_after
+                    .iter()
+                    .filter(|event| event.event_type == "assistant_response_completed")
+                    .count(),
+                1
+            );
+
+            // Invalid evidence is visible but never blocks the outcome.
+            open_turn(brain, "s-invalid", "project-a");
+            let invalid: JournalEventBody = serde_json::from_value(serde_json::json!({
+                "brain_id": brain,
+                "event_type": "assistant_response_completed",
+                "session_id": "s-invalid",
+                "host": "claude_code",
+                "evidence_input": {"kind": "unknown", "absolute_path": "/secret"},
+                "idempotency_key": "stop-s-invalid-1"
+            }))
+            .unwrap();
+            let Json(invalid_response) = journal_event(State(ServerState {}), Json(invalid))
+                .await
+                .unwrap();
+            assert_eq!(invalid_response["written"], true);
+            assert_eq!(
+                invalid_response["evidence_capture"]["code"],
+                "invalid_input"
+            );
+            assert!(!invalid_response.to_string().contains("/secret"));
+            assert!(!journal_text(&home, brain).contains("/secret"));
+
+            // Consent off is also fail-open and performs no source read.
+            std::fs::write(
+                home.join("local_curator.json"),
+                r#"{"enabled":false,"transcript_access":true}"#,
+            )
+            .unwrap();
+            open_turn(brain, "s-disabled", "project-a");
+            let disabled_path = project.join("s-disabled.jsonl");
+            let disabled: JournalEventBody = serde_json::from_value(serde_json::json!({
+                "brain_id": brain,
+                "event_type": "assistant_response_completed",
+                "session_id": "s-disabled",
+                "host": "claude_code",
+                "evidence_input": {
+                    "kind": "transcript",
+                    "absolute_path": disabled_path.to_string_lossy(),
+                    "observed_prefix_len": 10
+                },
+                "idempotency_key": "stop-s-disabled-10"
+            }))
+            .unwrap();
+            let Json(disabled_response) = journal_event(State(ServerState {}), Json(disabled))
+                .await
+                .unwrap();
+            assert_eq!(disabled_response["written"], true);
+            assert_eq!(
+                disabled_response["evidence_capture"]["code"],
+                "curator_disabled"
+            );
+            assert!(!journal_text(&home, brain).contains(disabled_path.to_string_lossy().as_ref()));
+
+            // A private declared or inherited room is rejected before any
+            // evidence attempt and never creates an outcome event.
+            open_turn(brain, "s-private", "clients/_PRIVATE");
+            let private: JournalEventBody = serde_json::from_value(serde_json::json!({
+                "brain_id": brain,
+                "event_type": "assistant_response_completed",
+                "session_id": "s-private",
+                "host": "spoofed-host",
+                "room": "clients/_PRIVATE",
+                "evidence_input": {
+                    "kind": "transcript",
+                    "absolute_path": project.join("missing-private.jsonl").to_string_lossy(),
+                    "observed_prefix_len": 10
+                },
+                "idempotency_key": "stop-s-private-10"
+            }))
+            .unwrap();
+            let Json(private_response) = journal_event(State(ServerState {}), Json(private))
+                .await
+                .unwrap();
+            assert_eq!(private_response["written"], false);
+            assert!(private_response["evidence_capture"].is_null());
+
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("NEUROVAULT_HOME");
+            let _ = std::fs::remove_dir_all(root);
+        });
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AmbientLogQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default, alias = "brain")]
+    brain_id: Option<String>,
+    /// "inject" | "silent" — omit for both.
+    #[serde(default)]
+    decision: Option<String>,
+    #[serde(default)]
+    intent: Option<String>,
+}
+
+/// GET /api/ambient_log — the Memory Inspector's feed (adaptive-memory
+/// spec V1c-1). Returns the newest decision-log records, newest first,
+/// with optional brain/decision/intent filters. Reads the JSONL tail;
+/// the log rotates at 8MB so a full read stays cheap.
+pub async fn ambient_log(
+    Query(q): Query<AmbientLogQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let limit = q.limit.unwrap_or(50).min(500);
+        let path = super::ambient::log_path();
+        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut records: Vec<serde_json::Value> = raw
+            .lines()
+            .rev()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| {
+                q.brain_id
+                    .as_deref()
+                    .is_none_or(|b| r["brain"].as_str() == Some(b))
+                    && q.decision
+                        .as_deref()
+                        .is_none_or(|d| r["decision"].as_str() == Some(d))
+                    && q.intent
+                        .as_deref()
+                        .is_none_or(|i| r["intent"].as_str() == Some(i))
+            })
+            .take(limit)
+            .collect();
+        // rev() above walks newest-last files backwards, so records are
+        // already newest-first; keep them that way.
+        let total = records.len();
+        records.shrink_to_fit();
+        Ok(serde_json::json!({ "records": records, "count": total }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+/// GET /api/home_brief — the living-memory briefing for the Home
+/// screen (read-only). Assembles, across ALL brains: the freshest
+/// "continue where you left off" candidate (from each brain's
+/// WorkingState), the total review backlog, how many sessions were
+/// observed today, and a short "since you were away" digest of
+/// meaningful recent changes. One call so Home stays snappy; touches
+/// no memory semantics (pure read of state the system already keeps).
+pub async fn home_brief(_s: State<ServerState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        use time::OffsetDateTime;
+        let now = OffsetDateTime::now_utc();
+        let day_ago = now - time::Duration::hours(24);
+        let midnight = now.replace_time(time::Time::MIDNIGHT);
+
+        let brains = super::read_ops::list_brains_with_stats()?;
+        let mut needs_review = 0usize;
+        let mut needs_review_by_brain = serde_json::Map::new();
+        let mut sessions_today = 0usize;
+        let mut context_added_today = 0usize;
+        let mut context_quiet_today = 0usize;
+        let mut memories_surfaced_today = 0usize;
+        let mut notes_changed_today = 0usize;
+        let mut best_continue: Option<serde_json::Value> = None;
+        let mut best_updated = String::new();
+        let mut since: Vec<(String, serde_json::Value)> = Vec::new();
+
+        for b in &brains {
+            let scope = super::adaptive::Scope {
+                brain_id: b.id.clone(),
+                room: None,
+            };
+            // Continue candidate: freshest non-empty working state.
+            let ws = super::adaptive::types::load_working_state(&scope);
+            if !ws.is_empty() {
+                if let Some(ts) = &ws.updated_at {
+                    if ts.as_str() > best_updated.as_str() {
+                        best_updated = ts.clone();
+                        best_continue = Some(serde_json::json!({
+                            "brain": b.id,
+                            "brain_name": b.name,
+                            "current_task": ws.current_task,
+                            "next_step": ws.next_step,
+                            "last_files": ws.last_files,
+                            "updated_at": ws.updated_at,
+                            "stale": ws.is_stale(now),
+                        }));
+                    }
+                }
+            }
+            // Review backlog (unreviewed proposals) across brains.
+            let brain_needs_review = super::adaptive::proposals::load_all(&b.id)
+                .values()
+                .filter(|p| {
+                    matches!(
+                        p.review_status,
+                        super::adaptive::proposals::ReviewStatus::Unreviewed
+                    )
+                })
+                .count();
+            needs_review += brain_needs_review;
+            needs_review_by_brain.insert(b.id.clone(), serde_json::json!(brain_needs_review));
+            // Recent journal → sessions today + a change digest.
+            let events = super::journal::read_window(&b.id, day_ago, now, None);
+            let mut seen_sessions = std::collections::HashSet::new();
+            for e in &events {
+                let parsed_ts = time::OffsetDateTime::parse(
+                    &e.ts,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .ok();
+                if let (Some(sid), Some(ts)) = (e.session_id.as_deref(), parsed_ts) {
+                    if ts >= midnight {
+                        seen_sessions.insert(sid.to_string());
+                    }
+                }
+                if parsed_ts.is_some_and(|ts| ts >= midnight) {
+                    match e.event_type.as_str() {
+                        "context_decision"
+                            if e.after
+                                .as_deref()
+                                .is_some_and(|value| value.starts_with("inject ")) =>
+                        {
+                            context_added_today += 1;
+                            memories_surfaced_today += e
+                                .after
+                                .as_deref()
+                                .and_then(|value| value.split(';').nth(1))
+                                .and_then(|value| value.split_whitespace().next())
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(0);
+                        }
+                        "context_decision" => context_quiet_today += 1,
+                        "note_created" | "note_updated" => notes_changed_today += 1,
+                        _ => {}
+                    }
+                }
+                let text = match e.event_type.as_str() {
+                    "playbook_rule_added" => {
+                        Some(format!("A correction became a rule in {}", b.name))
+                    }
+                    "note_superseded" => Some(format!("A note was replaced in {}", b.name)),
+                    "task_completed" => Some(format!("A task was completed in {}", b.name)),
+                    "working_state_updated" => Some(format!("Working state moved in {}", b.name)),
+                    "note_created" => Some(format!("A memory was added to {}", b.name)),
+                    "note_updated" => Some(format!("A memory was updated in {}", b.name)),
+                    _ => None,
+                };
+                if let Some(t) = text {
+                    since.push((
+                        format!("{}:{}:{}", b.id, e.event_type, e.object_id),
+                        serde_json::json!({ "brain": b.id, "text": t, "ts": e.ts }),
+                    ));
+                }
+            }
+            sessions_today += seen_sessions.len();
+        }
+        // newest changes first, capped
+        since.sort_by(|a, b| {
+            b.1["ts"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(a.1["ts"].as_str().unwrap_or(""))
+        });
+        let mut seen_changes = std::collections::HashSet::new();
+        since.retain(|(key, _)| seen_changes.insert(key.clone()));
+        since.truncate(5);
+        let since: Vec<_> = since.into_iter().map(|(_, value)| value).collect();
+
+        Ok(serde_json::json!({
+            "needs_review": needs_review,
+            "needs_review_by_brain": needs_review_by_brain,
+            "sessions_today": sessions_today,
+            "activity": {
+                "context_added": context_added_today,
+                "context_quiet": context_quiet_today,
+                "memories_surfaced": memories_surfaced_today,
+                "notes_changed": notes_changed_today,
+            },
+            "continue": best_continue,
+            "since": since,
+        }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+/// GET /api/working_state — the per-scope hot buffer behind the/// GET /api/working_state — the per-scope hot buffer behind the
+/// `continue_work` intent (docs/specs/adaptive-memory.md §3.2.3).
+pub async fn working_state_get(
+    Query(q): Query<WorkingStateQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(q.brain_id.as_deref())?;
+        let scope = scope_for(&id, q.room.as_deref());
+        let ws = super::adaptive::types::load_working_state(&scope);
+        let stale = ws.is_stale(time::OffsetDateTime::now_utc());
+        Ok(serde_json::json!({ "brain": id, "room": scope.room, "stale": stale, "state": ws }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct WorkingStateQuery {
+    #[serde(default, alias = "brain")]
+    brain_id: Option<String>,
+    #[serde(default)]
+    room: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct WorkingStateSetBody {
+    #[serde(default, alias = "brain")]
+    brain_id: Option<String>,
+    #[serde(default)]
+    room: Option<String>,
+    #[serde(flatten)]
+    update: super::adaptive::types::WorkingState,
+}
+
+/// POST /api/working_state — merge a partial update into the buffer
+/// (Some/non-empty fields overwrite; the rest survive). Agents report
+/// what they're doing; "continue" replays it for free.
+pub async fn working_state_set(
+    _s: State<ServerState>,
+    Json(body): Json<WorkingStateSetBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(body.brain_id.as_deref())?;
+        let scope = scope_for(&id, body.room.as_deref());
+        let mut ws = super::adaptive::types::load_working_state(&scope);
+        let before = ws.current_task.clone().unwrap_or_else(|| "(empty)".into());
+        ws.apply(body.update, time::OffsetDateTime::now_utc());
+        super::adaptive::types::save_working_state(&scope, &ws)?;
+        {
+            let mut ev = super::journal::Event::now(
+                &id,
+                "working_state_updated",
+                "working_state",
+                &scope.room_slug(),
+            );
+            ev.room = scope.room.clone();
+            ev.actor = ws
+                .updated_by
+                .clone()
+                .map(|a| format!("agent:{a}"))
+                .unwrap_or_else(|| "user".into());
+            ev.before = Some(before.chars().take(120).collect());
+            ev.after = ws
+                .current_task
+                .clone()
+                .map(|t| t.chars().take(120).collect());
+            ev.capture_method = "endpoint".into();
+            super::journal::record(ev);
+        }
+        Ok(serde_json::json!({ "brain": id, "room": scope.room, "status": "updated", "state": ws }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct PlaybookRuleBody {
+    #[serde(default, alias = "brain")]
+    brain_id: Option<String>,
+    #[serde(default)]
+    room: Option<String>,
+    /// The rule itself ("Avoid cost-cutting framing; use operational
+    /// resilience framing.").
+    rule: String,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// POST /api/playbook_rule — capture a user correction as a typed
+/// PlaybookRule note (importance=high, confidence=high; the single
+/// highest-value capture in the system, spec §3.2.6). Written through
+/// the NORMAL note path (markdown canonical), then kind-tagged
+/// `preference` so the PlaybookRules recipe sections retrieve it.
+pub async fn playbook_rule_create(
+    _s: State<ServerState>,
+    Json(body): Json<PlaybookRuleBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        if body.rule.trim().len() < 8 {
+            return Err(MemoryError::Other("rule text too short".into()));
+        }
+        let id = resolve_brain_id(body.brain_id.as_deref())?;
+        let scope = scope_for(&id, body.room.as_deref());
+        let now = time::OffsetDateTime::now_utc();
+        let rule = super::adaptive::types::PlaybookRule::from_correction(
+            body.rule.trim(),
+            scope.room.clone(),
+            now,
+        );
+        let title = body.title.clone().unwrap_or_else(|| {
+            let t: String = body.rule.trim().chars().take(60).collect();
+            format!("Rule: {t}")
+        });
+        let md = rule.to_markdown(&title);
+        // playbook/ folder inside the room (or brain-wide playbook/).
+        let slug: String = title
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .split('-')
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("-");
+        let short = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let prefix = scope
+            .room
+            .as_ref()
+            .map(|r| format!("{r}/playbook"))
+            .unwrap_or_else(|| "playbook".to_string());
+        // `slug` is NOT ASCII: it is built with Unicode `is_alphanumeric`
+        // and `to_ascii_lowercase`, so `é`/`日` survive into it. Slicing
+        // at a fixed byte count would split them.
+        let filename = format!(
+            "{prefix}/{}-{short}.md",
+            crate::memory::text::truncate_bytes(&slug, 48)
+        );
+        let ctx = super::write_ops::BrainContext::resolve(Some(&id), super::paths::vault_dir(&id))?;
+        let res = super::write_ops::save_note(&ctx, &filename, &md)?;
+        {
+            // Direct kind tag — deterministic, no reliance on the
+            // preference-extraction heuristics.
+            let conn = ctx.db.lock();
+            let _ = conn.execute(
+                "UPDATE engrams SET kind = 'preference', importance = 'high', \
+                 last_confirmed_at = datetime('now') WHERE id = ?1",
+                rusqlite::params![res.engram_id],
+            );
+        }
+        {
+            // Explicit user correction — the highest-confidence
+            // experience the system can capture.
+            let mut ev =
+                super::journal::Event::now(&id, "playbook_rule_added", "engram", &res.engram_id);
+            ev.title = Some(title.clone());
+            ev.kind = Some("preference".into());
+            ev.room = scope.room.clone();
+            ev.after = Some(body.rule.trim().chars().take(160).collect());
+            ev.capture_method = "explicit_correction".into();
+            ev.confidence = 0.95;
+            super::journal::record(ev);
+        }
+        Ok(serde_json::json!({
+            "brain": id,
+            "engram_id": res.engram_id,
+            "filename": res.filename,
+            "status": res.status,
+        }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+/// Shared scope builder for the adaptive endpoints.
+fn scope_for(brain_id: &str, room: Option<&str>) -> super::adaptive::Scope {
+    super::adaptive::Scope {
+        brain_id: brain_id.to_string(),
+        room: room
+            .map(super::adaptive::normalize_room)
+            .filter(|r| !r.is_empty()),
+    }
+}
+
+/// POST /api/ambient_recall — the Ambient Recall engine (see
+/// docs/specs/ambient-recall.md). Body: AmbientQueryPacket. Ambient
+/// traffic never touches the recall throttle: it is machine-paced, and
+/// its own gate is the rate control ("prefer silence over weak
+/// context"). Runs on the blocking pool: retrieval + the reranker are
+/// CPU-bound.
+pub async fn ambient_recall(
+    _s: State<ServerState>,
+    Json(packet): Json<super::ambient::AmbientQueryPacket>,
+) -> Result<Json<super::ambient::AmbientResponse>, ApiError> {
+    let out = tokio::task::spawn_blocking(
+        move || -> Result<super::ambient::AmbientResponse, MemoryError> {
+            let id = resolve_brain_id(packet.brain.as_deref())?;
+            let db = open_brain(&id)?;
+            super::ambient::run(&db, &id, &packet)
+        },
+    )
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+pub async fn recall(
+    Query(q): Query<RecallQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<Vec<RecallHit>>, ApiError> {
+    // tokio::task::spawn_blocking because the retriever is sync and
+    // holds SQLite locks — keeping it off the async executor means
+    // a long retrieval doesn't stall the HTTP server for other
+    // inflight requests.
+    let brain_id = q.brain_id.clone();
+    let ablate_list: Vec<String> = q
+        .ablate
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let opts = RecallOpts {
+        top_k: q.limit.unwrap_or(10),
+        spread_hops: q.spread_hops.unwrap_or(0),
+        exclude_kinds: if q.include_observations.unwrap_or(false) {
+            Vec::new()
+        } else {
+            vec!["observation".to_string()]
+        },
+        as_of: q.as_of.clone(),
+        use_reranker: q.rerank.unwrap_or(rerank_enabled()),
+        ablate: ablate_list,
+    };
+    let query_str = q.q.clone();
+    // Copy these out before the closure moves `opts` + `q.q`. Both are
+    // small (a usize and a String) so cloning is free.
+    let top_k_for_audit = opts.top_k;
+    let q_for_audit = q.q.clone();
+
+    // Wrap the work so we can audit duration + result count.
+    let started = std::time::Instant::now();
+    let skip_throttle = q.throttle == Some(false);
+    let (id, result) =
+        tokio::task::spawn_blocking(move || -> Result<(String, Vec<RecallHit>), MemoryError> {
+            let id = resolve_brain_id(brain_id.as_deref())?;
+            let db = open_brain(&id)?;
+            // Both branches run the score-CAPTURING pipeline so every
+            // hit carries its `why` (the channel breakdown was always
+            // computed; it just never left the retriever). Identical
+            // hits/order/scores to the plain path — see
+            // `hybrid_retrieve_with_scores`.
+            let hits = if skip_throttle {
+                super::retriever::hybrid_retrieve_with_scores(&db, &query_str, &opts)?.0
+            } else {
+                hybrid_retrieve_throttled(&db, &query_str, &opts)?
+            };
+            Ok((id, hits))
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+
+    // Best-effort audit — never blocks the response. Args carry just
+    // the query string + limit so the activity panel can show a
+    // useful one-liner; the result_ids let the user click through
+    // to engrams from the audit row.
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let ids: Vec<String> = result.iter().map(|h| h.engram_id.clone()).take(5).collect();
+    let entry = super::tool_audit::AuditEntry::new("recall")
+        .with_args(serde_json::json!({ "q": q_for_audit, "limit": top_k_for_audit }))
+        .with_result_ids(ids)
+        .with_duration(duration_ms)
+        .with_status(200);
+    let _ = super::tool_audit::append(&id, &entry);
+
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Multi-query recall (POST /api/recall/multi).
+//
+// HyDE / query-expansion entry point. The agent supplies a primary
+// `q` plus 0-4 `additional_queries` — paraphrases, synonyms, or
+// "imagined answer passage" rewrites (HyDE). Each query is run
+// through the full hybrid pipeline (vec + BM25 + graph + RRF +
+// temporal-disambig + optional rerank). Results are then RRF-merged
+// across queries: an engram that ranks well under multiple phrasings
+// rises above one that only matches a single phrasing strongly.
+//
+// Why this lives in the server, not the agent: paraphrase mismatch
+// is a fundamental retrieval problem (BGE has a 384-dim vec; "tops"
+// and "shirts" can land far apart even though they're semantically
+// equivalent). The agent already pays for the LLM tokens to phrase
+// alternatives; the server provides the "merge multiple retrieval
+// passes" primitive so the agent doesn't have to re-implement RRF.
+//
+// Architecture is local-first: zero network calls. The LLM cost
+// stays in whatever process is calling MCP (Claude Code, Codex,
+// custom agent) — NeuroVault doesn't reach for cloud APIs.
+//
+// Cap: 5 queries total (1 primary + 4 additional). Each adds ~one
+// pipeline pass of latency. With reranker on, that's roughly N×
+// (50-100 ms) plus the per-query vec+BM25+graph cost. Caller opts in
+// via the MCP `additional_queries` parameter — single-query callers
+// see no change.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct RecallMultiBody {
+    /// Primary query — required. Used for BM25, graph signal, and
+    /// also embedded for vec search (so a multi-query call with
+    /// empty additional_queries behaves identically to single-query).
+    pub q: String,
+    /// Up to 4 additional phrasings or HyDE rewrites. Each is run
+    /// through the full pipeline; results are RRF-merged across all
+    /// queries.
+    #[serde(default)]
+    pub additional_queries: Vec<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub spread_hops: Option<u8>,
+    #[serde(default)]
+    pub as_of: Option<String>,
+    #[serde(default)]
+    pub include_observations: Option<bool>,
+    #[serde(default)]
+    pub brain_id: Option<String>,
+    #[serde(default)]
+    pub rerank: Option<bool>,
+    /// Same ablation surface as single-query recall — applied to
+    /// each per-query pipeline run.
+    #[serde(default)]
+    pub ablate: Option<String>,
+}
+
+pub async fn recall_multi(
+    _s: State<ServerState>,
+    Json(body): Json<RecallMultiBody>,
+) -> Result<Json<Vec<RecallHit>>, ApiError> {
+    // Compose the query list: primary first, then trimmed-and-deduped
+    // additional. Cap at 5 total. Empty/whitespace-only rewrites are
+    // silently dropped (a recall with `additional_queries=[""]` is
+    // still valid; the server treats it as "primary only").
+    let mut queries: Vec<String> = Vec::with_capacity(5);
+    let primary = body.q.trim().to_string();
+    if primary.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "empty primary query".into(),
+        ));
+    }
+    queries.push(primary.clone());
+    for q in body.additional_queries.into_iter().take(4) {
+        let trimmed = q.trim().to_string();
+        if !trimmed.is_empty() && !queries.iter().any(|p| p.eq_ignore_ascii_case(&trimmed)) {
+            queries.push(trimmed);
+        }
+    }
+
+    let top_k = body.limit.unwrap_or(10).clamp(1, 50);
+    let ablate_list: Vec<String> = body
+        .ablate
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Each per-query call oversamples 2× so RRF merge has signal
+    // beyond the final top_k. Cap per-query top_k at 50 to bound
+    // memory regardless of caller-supplied limit.
+    let per_query_top_k = (top_k * 2).clamp(top_k, 50);
+    // Force reranker off on per-query passes regardless of what the
+    // caller asked for. Reasoning: the per-query pipeline runs the
+    // cross-encoder over top-20 candidates, which is ~50-100 ms. With
+    // 5 queries that's ~500 ms of cross-encoder alone, dwarfing the
+    // ~50 ms vec+BM25+graph cost per pass and making multi-query
+    // ~10× more expensive than necessary. Cross-query RRF merge is
+    // itself a form of reranking — an engram that ranks top in
+    // multiple phrasings is intrinsically more reliable than the
+    // cross-encoder's verdict on a single phrasing. We trade single-
+    // pass cross-encoder precision for consensus-across-phrasings,
+    // which empirically maps better to "the right answer" on
+    // paraphrase-heavy queries (the use case for multi-query in the
+    // first place). Caller's `rerank` flag is preserved for the
+    // single-query fast path below.
+    let opts = RecallOpts {
+        top_k: per_query_top_k,
+        spread_hops: body.spread_hops.unwrap_or(0),
+        exclude_kinds: if body.include_observations.unwrap_or(false) {
+            Vec::new()
+        } else {
+            vec!["observation".to_string()]
+        },
+        as_of: body.as_of.clone(),
+        use_reranker: false,
+        ablate: ablate_list,
+    };
+    let brain_id = body.brain_id.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<RecallHit>, MemoryError> {
+        let id = resolve_brain_id(brain_id.as_deref())?;
+        let db = open_brain(&id)?;
+
+        // One-line audit so the bench harness / debug sessions can see
+        // how often the agent is escalating to multi-query.
+        eprintln!(
+            "[recall_multi] brain={} q_count={} primary={:?}",
+            id,
+            queries.len(),
+            queries
+                .first()
+                .map(|s| crate::memory::text::truncate_bytes(s, 60))
+                .unwrap_or("")
+        );
+
+        // Run each query through the full pipeline. Per-query failures
+        // (e.g. rate-limit hint, disk error mid-batch) are logged and
+        // skipped — a partial fan-out still produces a usable merge.
+        let mut per_query_hits: Vec<Vec<RecallHit>> = Vec::with_capacity(queries.len());
+        for q in &queries {
+            match hybrid_retrieve_throttled(&db, q, &opts) {
+                Ok(hs) => per_query_hits.push(hs),
+                Err(e) => {
+                    eprintln!("[recall_multi] query {:?} failed: {}", q, e);
+                }
+            }
+        }
+        if per_query_hits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Fast path — only the primary survived; return its results
+        // unchanged so the response is byte-for-byte equivalent to
+        // GET /api/recall.
+        if per_query_hits.len() == 1 {
+            return Ok(per_query_hits.into_iter().next().unwrap_or_default());
+        }
+
+        // Cross-query RRF. Standard formula: score += 1 / (k + rank).
+        // k=60 matches the existing rrf::rrf_score() constant so the
+        // magnitudes are comparable to the in-pipeline RRF.
+        const K: f64 = 60.0;
+        let mut rrf: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        let mut keep: std::collections::HashMap<String, RecallHit> =
+            std::collections::HashMap::new();
+        for hits in &per_query_hits {
+            for (rank0, h) in hits.iter().enumerate() {
+                if h.engram_id == super::retriever::THROTTLE_HINT_ID {
+                    // Don't merge throttle hints into the result set —
+                    // they're advisory. If every per-query call got
+                    // throttled, the caller will see an empty result
+                    // and re-issue.
+                    continue;
+                }
+                *rrf.entry(h.engram_id.clone()).or_insert(0.0) += 1.0 / (K + (rank0 + 1) as f64);
+                // Keep the highest-scoring representative (earliest
+                // rank wins by definition since RRF accumulates).
+                keep.entry(h.engram_id.clone()).or_insert_with(|| h.clone());
+            }
+        }
+
+        let mut sorted: Vec<(String, f64)> = rrf.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let merged: Vec<RecallHit> = sorted
+            .into_iter()
+            .take(top_k)
+            .filter_map(|(eid, fused)| {
+                keep.remove(&eid).map(|mut h| {
+                    // Overwrite `score` with the cross-query RRF score
+                    // (rounded for display) so the caller can see
+                    // multi-query consensus, not a single-pass score.
+                    h.score = (fused * 10000.0).round() / 10000.0;
+                    h
+                })
+            })
+            .collect();
+
+        Ok(merged)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Federated recall — run hybrid_retrieve across every brain in the
+// registry (or a caller-provided subset) and merge by score. Useful
+// when the user has multiple brains and doesn't remember which one
+// holds a fact: "search everywhere for X".
+//
+// Cost: linear in the number of brains. Each per-brain retrieval
+// runs through the throttled path (so spamming this from an agent
+// won't melt the box) and is capped at `per_brain` hits before
+// merging. With 6 brains and per_brain=5 you fan out to 30 hits and
+// truncate to top_k.
+//
+// Score merge: RRF scores are unitless and brain-relative — a 0.85
+// in a small brain isn't directly comparable to a 0.85 in a large
+// one. We normalize each brain's hits to a z-score before merging, so
+// the merge key is "best relative to its own brain" rather than raw
+// scale (with a small-sample guard for brains returning <2 hits). The
+// brain_id annotation still lets the caller re-weight by brain.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+pub struct CrossBrainQuery {
+    q: String,
+    /// Total hits returned. Default 10, max 50.
+    #[serde(default)]
+    top_k: Option<usize>,
+    /// Per-brain cap before merge. Default 5, max 20. Lower = faster
+    /// fan-out, higher = better recall on a brain with the right
+    /// answer that gets crowded out by others.
+    #[serde(default)]
+    per_brain: Option<usize>,
+    /// CSV of brain ids to search. Empty / missing = every brain in
+    /// the registry. Used by callers who want to scope to a curated
+    /// subset ("all my work brains, none of the personal ones").
+    #[serde(default)]
+    brains: Option<String>,
+    #[serde(default)]
+    include_observations: Option<bool>,
+    #[serde(default)]
+    rerank: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct CrossBrainHit {
+    brain_id: String,
+    brain_name: String,
+    engram_id: String,
+    title: String,
+    content: String,
+    score: f64,
+    strength: f64,
+    state: String,
+}
+
+#[derive(Serialize)]
+pub struct CrossBrainResponse {
+    query: String,
+    brains_searched: Vec<String>,
+    total: usize,
+    hits: Vec<CrossBrainHit>,
+}
+
+pub async fn recall_across_brains(
+    Query(q): Query<CrossBrainQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<CrossBrainResponse>, ApiError> {
+    let top_k = q.top_k.unwrap_or(10).clamp(1, 50);
+    let per_brain = q.per_brain.unwrap_or(5).clamp(1, 20);
+    let scoped: Vec<String> = q
+        .brains
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let opts = RecallOpts {
+        top_k: per_brain,
+        spread_hops: 0,
+        exclude_kinds: if q.include_observations.unwrap_or(false) {
+            Vec::new()
+        } else {
+            vec!["observation".to_string()]
+        },
+        as_of: None,
+        use_reranker: q.rerank.unwrap_or(rerank_enabled()),
+        ablate: Vec::new(),
+    };
+    let query_str = q.q.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<CrossBrainResponse, MemoryError> {
+        let summaries = list_brains_with_stats()?;
+        let candidates: Vec<(String, String)> = if scoped.is_empty() {
+            summaries.into_iter().map(|b| (b.id, b.name)).collect()
+        } else {
+            // Filter to the requested subset, but preserve registry order
+            // and use the registry's `name` so the response reads right
+            // even if the caller passed bare ids.
+            let by_id: std::collections::HashMap<String, String> = summaries
+                .into_iter()
+                .map(|b| (b.id.clone(), b.name))
+                .collect();
+            scoped
+                .into_iter()
+                .filter_map(|id| by_id.get(&id).map(|n| (id.clone(), n.clone())))
+                .collect()
+        };
+
+        let mut all_hits: Vec<CrossBrainHit> = Vec::new();
+        let mut searched: Vec<String> = Vec::with_capacity(candidates.len());
+        for (id, name) in &candidates {
+            // Skip-on-error per brain: one broken brain shouldn't fail
+            // the whole federated query. Caller sees a shorter
+            // brains_searched list and infers the rest.
+            let db = match open_brain(id) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("[recall_across_brains] open {} failed: {}", id, e);
+                    continue;
+                }
+            };
+            searched.push(id.clone());
+            match hybrid_retrieve_throttled(&db, &query_str, &opts) {
+                Ok(hits) => {
+                    for h in hits {
+                        all_hits.push(CrossBrainHit {
+                            brain_id: id.clone(),
+                            brain_name: name.clone(),
+                            engram_id: h.engram_id,
+                            title: h.title,
+                            content: h.content,
+                            score: h.score,
+                            strength: h.strength,
+                            state: h.state,
+                        });
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[recall_across_brains] retrieve {} failed: {}", id, e);
+                    continue;
+                }
+            }
+        }
+
+        // Per-brain score normalization (z-score) before the global merge.
+        // RRF scores are brain-relative — a 0.85 in a small brain isn't
+        // comparable to a 0.85 in a large one — so a raw-score merge lets a
+        // big brain's scale crowd out another brain's genuinely-better hit.
+        // Centering each brain's hits to mean 0 / std 1 makes "best relative
+        // to its own brain" the merge key.
+        //
+        // Small-sample guard (per_brain caps at 20, often 5): a brain with
+        // <2 hits or ~zero spread can't tell us whether its lone hit is
+        // relatively strong, so it gets a neutral z of 0.0 — this deliberately
+        // avoids the naive min-max trap where one weak lone hit normalizes to
+        // the very top.
+        let mut score_by_brain: std::collections::HashMap<String, Vec<f64>> =
+            std::collections::HashMap::new();
+        for h in &all_hits {
+            score_by_brain
+                .entry(h.brain_id.clone())
+                .or_default()
+                .push(h.score);
+        }
+        let brain_stats: std::collections::HashMap<String, (f64, f64)> = score_by_brain
+            .into_iter()
+            .map(|(brain, scores)| {
+                let n = scores.len() as f64;
+                let mean = scores.iter().sum::<f64>() / n;
+                let std = if scores.len() >= 2 {
+                    (scores.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt()
+                } else {
+                    0.0
+                };
+                (brain, (mean, std))
+            })
+            .collect();
+        let znorm = |h: &CrossBrainHit| -> f64 {
+            match brain_stats.get(&h.brain_id) {
+                Some(&(mean, std)) if std > 1e-9 => (h.score - mean) / std,
+                _ => 0.0, // single-hit / zero-spread brain → neutral
+            }
+        };
+        // Sort by normalized score desc; partial_cmp is fine — z-scores are
+        // finite. Unwrap_or keeps things sane in any degenerate case.
+        all_hits.sort_by(|a, b| {
+            znorm(b)
+                .partial_cmp(&znorm(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all_hits.truncate(top_k);
+        let total = all_hits.len();
+        Ok(CrossBrainResponse {
+            query: query_str,
+            brains_searched: searched,
+            total,
+            hits: all_hits,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+
+    Ok(Json(result))
+}
+
+// Allow unused — the `mode` field exists for Python-compat; we don't
+// act on it yet. (The Python server accepts it; dropping it would
+// break clients that set it.)
+#[allow(dead_code)]
+fn _consume_mode(_: &str) {}
+
+// --- Tier-A agent-efficiency endpoints --------------------------------
+//
+// 1) GET  /api/related/:engram_id       — cheap neighbour lookup,
+//    replaces follow-up recall calls.
+// 2) POST /api/notes                    — remember, with optional
+//    `deduplicate` threshold that short-circuits near-duplicate
+//    writes + returns the matched engram id instead.
+
+#[derive(Deserialize)]
+pub struct RelatedQuery {
+    #[serde(default)]
+    hops: Option<u8>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    min_similarity: Option<f64>,
+    #[serde(default)]
+    link_types: Option<String>, // comma-separated
+    #[serde(default)]
+    include_observations: Option<bool>,
+    #[serde(default)]
+    brain_id: Option<String>,
+}
+
+pub async fn related(
+    axum::extract::Path(engram_id): axum::extract::Path<String>,
+    Query(q): Query<RelatedQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<Vec<RelatedHit>>, ApiError> {
+    let brain_id = q.brain_id.clone();
+    let opts = RelatedOpts {
+        hops: q.hops.unwrap_or(1),
+        limit: q.limit.unwrap_or(20),
+        min_similarity: q.min_similarity.unwrap_or(0.55),
+        link_types: q.link_types.as_ref().map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        }),
+        exclude_kinds: if q.include_observations.unwrap_or(false) {
+            Vec::new()
+        } else {
+            vec!["observation".to_string()]
+        },
+    };
+    let eid = engram_id.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<RelatedHit>, MemoryError> {
+        let id = resolve_brain_id(brain_id.as_deref())?;
+        let db = super::db::open_brain(&id)?;
+        get_related_checked(&db, &eid, &opts)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+pub struct RememberBody {
+    title: Option<String>,
+    content: String,
+    #[serde(default)]
+    brain: Option<String>,
+    /// Cosine-similarity threshold (0..=1). When present and a
+    /// non-dormant engram matches above the threshold, skip the
+    /// ingest and return the matched engram id with status="merged".
+    /// Agents pass ~0.92 to merge only near-identical content; the
+    /// default keeps the legacy behaviour (no dedupe) for clients
+    /// that don't know about the parameter.
+    #[serde(default)]
+    deduplicate: Option<f64>,
+    /// Optional folder under the vault. `projects/` places the new
+    /// note under that subdirectory. Defaults to the vault root.
+    #[serde(default)]
+    folder: Option<String>,
+    /// Optional engram ids this new note replaces. Each is marked
+    /// superseded by the new note so recall stops serving the stale
+    /// ones. Lets an agent write the new truth and retire the old in a
+    /// single call. Ignored on a dedupe "merged" result (nothing new
+    /// was written to supersede with).
+    #[serde(default)]
+    supersedes: Vec<String>,
+    /// Optional AUTHORITATIVE trust value in [0,1] for the new note.
+    /// Absent (the normal case) = the reader falls back to the
+    /// structural estimate derived from the note's kind. Annotation
+    /// only: confidence never enters ranking. Ignored on a dedupe
+    /// "merged" result — no new note was written, and silently
+    /// re-scoring somebody else's existing note is not this call's job.
+    #[serde(default)]
+    confidence: Option<f64>,
+}
+
+/// Reject a `confidence` outside [0,1] instead of clamping it. A caller
+/// that sends 60 (meaning 60%) has a bug we want surfaced, not a value
+/// silently rewritten to 1.0 that then reads as "certain".
+fn validate_confidence(c: Option<f64>) -> Result<(), ApiError> {
+    if let Some(c) = c {
+        if !c.is_finite() || !(0.0..=1.0).contains(&c) {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("confidence must be a number in [0.0, 1.0]; got {c}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct ConflictCandidate {
+    pub id: String,
+    pub title: String,
+    pub similarity: f64,
+}
+
+#[derive(Serialize)]
+pub struct RememberResult {
+    status: String, // "created" | "updated" | "unchanged" | "merged"
+    engram_id: String,
+    /// Only populated on `status == "merged"` — the cosine similarity
+    /// that triggered the merge. Lets agents decide whether to retry
+    /// with a higher threshold if they wanted the note created anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    similarity: Option<f64>,
+    /// Existing notes in the mid-similarity band (same topic, likely a
+    /// different claim) that the new note MAY contradict. Detection only
+    /// — nothing is auto-superseded. The agent decides whether to call
+    /// `supersede_note` (or pass `supersedes`) to retire the stale one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    potential_conflicts: Vec<ConflictCandidate>,
+}
+
+/// Write-time conflict band. Below the floor = unrelated; at/above the
+/// ceiling = near-duplicate (handled by dedupe, not a contradiction).
+/// In between = "same topic, probably a different claim" → worth a heads-up.
+const CONFLICT_FLOOR: f64 = 0.82;
+const CONFLICT_CEIL: f64 = 0.92;
+
+/// Hard ceiling on `remember` content size. Agents occasionally send
+/// an entire wiki page or multi-KB transcript; running the full
+/// chunk+embed+link pipeline on content that large compounds badly
+/// with the vault watcher's re-ingest (which also fires on the
+/// newly-written file). We reject anything larger with a clear
+/// error telling the caller to chunk their content upstream. 32 KB
+/// comfortably covers multi-paragraph insights; anything beyond is
+/// almost always "I should have written multiple notes."
+pub const REMEMBER_MAX_BYTES: usize = 32 * 1024;
+
+pub async fn remember(
+    _s: State<ServerState>,
+    Json(body): Json<RememberBody>,
+) -> Result<Json<RememberResult>, ApiError> {
+    if body.content.len() > REMEMBER_MAX_BYTES {
+        return Err(ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "content is {} bytes; remember() accepts up to {} bytes. \
+                 Split into multiple engrams or use file-level ingest instead.",
+                body.content.len(),
+                REMEMBER_MAX_BYTES
+            ),
+        ));
+    }
+    validate_confidence(body.confidence)?;
+    let brain_id = body.brain.clone();
+    let title_hint = body.title.clone();
+    let content = body.content.clone();
+    let dedupe = body.deduplicate;
+    let folder = body.folder.clone();
+    let supersedes = body.supersedes.clone();
+    let confidence = body.confidence;
+
+    let result = tokio::task::spawn_blocking(move || -> Result<RememberResult, MemoryError> {
+        let id = resolve_brain_id(brain_id.as_deref())?;
+        let db = super::db::open_brain(&id)?;
+
+        // Derive title FIRST so dedupe can compare apples-to-apples
+        // against what's stored. The stored embedding is built from
+        // the full markdown (`# {title}\n\n{content}`) with a
+        // chunker title-prefix on top, so dedupe has to see the
+        // same shape.
+        let title = title_hint
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| {
+                let first = content.lines().next().unwrap_or("").trim();
+                let stripped = first.trim_start_matches('#').trim();
+                let truncated: String = stripped.chars().take(60).collect();
+                if truncated.is_empty() {
+                    "Untitled".to_string()
+                } else {
+                    truncated
+                }
+            });
+        let seed = format!("# {}\n\n{}", title, content);
+
+        // One similarity scan powers both decisions below: the dedupe
+        // merge AND the write-time conflict heads-up.
+        let nearest = ingest::nearest_doc_match(&db, &seed, None)?;
+
+        // Dedupe short-circuit: a near-identical existing note means we
+        // skip the write and return the match as "merged".
+        if let Some(threshold) = dedupe {
+            if let Some((matched_id, sim)) = &nearest {
+                if *sim >= threshold {
+                    return Ok(RememberResult {
+                        status: "merged".to_string(),
+                        engram_id: matched_id.clone(),
+                        similarity: Some(*sim),
+                        potential_conflicts: vec![],
+                    });
+                }
+            }
+        }
+
+        // Slug + filename — same pattern write_ops::create_note uses.
+        let slug = slug::slugify(&title);
+        let short = &uuid::Uuid::new_v4().to_string()[..8];
+        let base = format!("{}-{}.md", slug, short);
+        let filename = match folder.as_ref() {
+            Some(f) if !f.is_empty() => format!("{}/{}", f.trim_end_matches('/'), base),
+            _ => base,
+        };
+
+        // Write the markdown file into the active vault so the
+        // watcher + ingest pipeline see it. We round-trip through
+        // the filesystem to keep MCP writes symmetric with Tauri UI
+        // writes + preserve the markdown-as-source-of-truth invariant.
+        let vault = super::read_ops::resolve_vault_path(&id)?;
+        let ctx = super::write_ops::BrainContext::resolve(Some(&id), vault)?;
+        let write = super::write_ops::save_note(&ctx, &filename, &seed)?;
+
+        // Authoritative confidence, when the caller asserted one. Best
+        // effort: the note is already on disk and indexed, so a failure
+        // to annotate must not fail the save — the reader just falls
+        // back to the structural estimate.
+        if let Some(c) = confidence {
+            if let Err(e) = super::retriever::set_engram_confidence(&db, &write.engram_id, c) {
+                eprintln!("[remember] confidence annotation failed: {e}");
+            }
+        }
+
+        // Audit the write. `args` carries title + a short preview of
+        // the content so the activity panel can render a meaningful
+        // one-liner without storing the full body in the audit log.
+        let preview: String = content.chars().take(120).collect();
+        let entry = super::tool_audit::AuditEntry::new("remember")
+            .with_args(serde_json::json!({ "title": title, "preview": preview }))
+            .with_modified_ids(vec![write.engram_id.clone()])
+            .with_status(200);
+        let _ = super::tool_audit::append(&id, &entry);
+
+        // Retire any notes this one explicitly replaces. Best-effort:
+        // a missing/typo'd old id is skipped (supersede_note returns
+        // false), and we never let a supersede failure undo the write
+        // that already succeeded.
+        for old_id in &supersedes {
+            if old_id == &write.engram_id {
+                continue;
+            }
+            let _ = super::write_ops::supersede_note(
+                &db,
+                old_id,
+                &write.engram_id,
+                Some("replaced by a newer note (remember supersedes)"),
+            );
+        }
+
+        // Write-time conflict heads-up: if the nearest existing note sits
+        // in the mid-similarity band, it's likely the same topic with a
+        // different claim. Surface it (detection only — the agent decides
+        // whether to supersede). Skip anything already superseded here.
+        let mut potential_conflicts = Vec::new();
+        if let Some((mid, sim)) = &nearest {
+            if *sim >= CONFLICT_FLOOR
+                && *sim < CONFLICT_CEIL
+                && mid != &write.engram_id
+                && !supersedes.iter().any(|s| s == mid)
+            {
+                let title: String = {
+                    let conn = db.lock();
+                    conn.query_row(
+                        "SELECT title FROM engrams WHERE id = ?1 AND superseded_by IS NULL",
+                        [mid],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .unwrap_or_default()
+                };
+                if !title.is_empty() {
+                    potential_conflicts.push(ConflictCandidate {
+                        id: mid.clone(),
+                        title,
+                        similarity: (*sim * 1000.0).round() / 1000.0,
+                    });
+                }
+            }
+        }
+
+        Ok(RememberResult {
+            status: write.status,
+            engram_id: write.engram_id,
+            similarity: None,
+            potential_conflicts,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Save / delete by filename. POST /api/notes (the `remember` endpoint
+// above) always creates a new note with an auto-generated filename;
+// these two are the symmetric write paths the desktop UI's save and
+// delete buttons need, exposed over HTTP so the VS Code extension
+// webview can drive them when the Tauri-only invoke() path is not
+// available.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct SaveBody {
+    filename: String,
+    content: String,
+    #[serde(default)]
+    brain: Option<String>,
+    /// Optional AUTHORITATIVE trust value in [0,1] for the saved note —
+    /// the update-side twin of `remember`'s parameter. Absent leaves any
+    /// existing annotation untouched (and the reader keeps falling back
+    /// to the structural estimate). Annotation only, never a ranking
+    /// input.
+    #[serde(default)]
+    confidence: Option<f64>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct DeleteBody {
+    filename: String,
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct WriteResponse {
+    status: String,
+    engram_id: String,
+    filename: String,
+    brain_id: String,
+}
+
+pub async fn notes_save(
+    _s: State<ServerState>,
+    Json(body): Json<SaveBody>,
+) -> Result<Json<WriteResponse>, ApiError> {
+    if body.content.len() > REMEMBER_MAX_BYTES {
+        return Err(ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "content is {} bytes; save accepts up to {} bytes.",
+                body.content.len(),
+                REMEMBER_MAX_BYTES
+            ),
+        ));
+    }
+    validate_confidence(body.confidence)?;
+    let result = tokio::task::spawn_blocking(move || -> Result<WriteResponse, MemoryError> {
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        let vault = super::read_ops::resolve_vault_path(&id)?;
+        let ctx = super::write_ops::BrainContext::resolve(Some(&id), vault)?;
+        let res = super::write_ops::save_note(&ctx, &body.filename, &body.content)?;
+        // Best-effort annotation, same contract as `remember`: the file
+        // is already saved and indexed, so this can't fail the write.
+        if let Some(c) = body.confidence {
+            let db = open_brain(&id)?;
+            if let Err(e) = super::retriever::set_engram_confidence(&db, &res.engram_id, c) {
+                eprintln!("[save] confidence annotation failed: {e}");
+            }
+        }
+        Ok(WriteResponse {
+            status: res.status,
+            engram_id: res.engram_id,
+            filename: body.filename,
+            brain_id: id,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+pub struct SupersedeBody {
+    /// The stale note being retired.
+    pub old_id: String,
+    /// The note that replaces it (the new truth).
+    pub new_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub brain: Option<String>,
+}
+
+/// POST /api/notes/supersede — mark `old_id` superseded by `new_id` so
+/// recall stops serving the stale note. Backs the `supersede_note` MCP
+/// tool. Caller-driven; reversible (note stays on disk + in the DB).
+pub async fn notes_supersede(
+    _s: State<ServerState>,
+    Json(body): Json<SupersedeBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        let db = open_brain(&id)?;
+        let updated = super::write_ops::supersede_note(
+            &db,
+            &body.old_id,
+            &body.new_id,
+            body.reason.as_deref(),
+        )?;
+        Ok(serde_json::json!({
+            "ok": updated,
+            "old_id": body.old_id,
+            "new_id": body.new_id,
+            "status": if updated { "superseded" } else { "old_id not found" },
+        }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+pub async fn notes_delete(
+    _s: State<ServerState>,
+    Json(body): Json<DeleteBody>,
+) -> Result<Json<WriteResponse>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<WriteResponse, MemoryError> {
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        let vault = super::read_ops::resolve_vault_path(&id)?;
+        let ctx = super::write_ops::BrainContext::resolve(Some(&id), vault)?;
+        let res = super::write_ops::delete_note(&ctx, &body.filename)?;
+        Ok(WriteResponse {
+            status: res.status,
+            engram_id: res.engram_id,
+            filename: body.filename,
+            brain_id: id,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Full-brain update: re-scan the vault, re-ingest anything whose content
+// hash has changed, soft-delete engrams whose markdown file no longer
+// exists on disk. Idempotent and cheap when nothing changed (the
+// content_hash short-circuit in ingest::ingest_file means each file
+// reads its bytes once and exits without touching the DB).
+//
+// Backs the `/update` MCP command. Useful when the user has edited
+// markdown files outside the desktop app (Obsidian, vim, Drive sync)
+// and wants the index to catch up without restarting the app.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+pub struct UpdateBody {
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct UpdateResult {
+    brain_id: String,
+    scanned: u32,
+    ingested: u32,
+    unchanged: u32,
+    deleted: u32,
+    elapsed_ms: u64,
+}
+
+pub fn collect_md_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        // Skip dotfile dirs / files (.git, .obsidian, .DS_Store, …).
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            // Skip the trash subdirectory — those are soft-deleted notes
+            // we do NOT want to re-ingest. Anything else recurses.
+            if name == "trash" {
+                continue;
+            }
+            collect_md_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            out.push(path);
+        }
+    }
+}
+
+pub async fn update_brain(
+    _s: State<ServerState>,
+    body: Option<Json<UpdateBody>>,
+) -> Result<Json<UpdateResult>, ApiError> {
+    let body = body.map(|j| j.0).unwrap_or_default();
+    let result = tokio::task::spawn_blocking(move || -> Result<UpdateResult, MemoryError> {
+        let started = std::time::Instant::now();
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        let vault = super::read_ops::resolve_vault_path(&id)?;
+        let db = super::db::open_brain(&id)?;
+
+        // Pass 1 — walk the vault and re-ingest anything that changed.
+        let mut files = Vec::new();
+        collect_md_files(&vault, &mut files);
+        let scanned = files.len() as u32;
+        let mut ingested = 0u32;
+        let mut unchanged = 0u32;
+        for path in &files {
+            match super::ingest::ingest_file(path, Some(&vault), &db) {
+                Ok(Some(_)) => ingested += 1,
+                Ok(None) => unchanged += 1,
+                Err(e) => eprintln!("[update] ingest failed for {}: {}", path.display(), e),
+            }
+        }
+
+        // Pass 2 — find engrams whose file no longer exists on disk and
+        // soft-delete them. Cheap: one query, one HashSet build, then a
+        // membership check per engram.
+        let mut on_disk: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for p in &files {
+            if let Ok(rel) = p.strip_prefix(&vault) {
+                on_disk.insert(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        let rows: Vec<(String, String)> = {
+            let conn = db.lock();
+            let mut stmt =
+                conn.prepare("SELECT id, filename FROM engrams WHERE state != 'dormant'")?;
+            let mapped = stmt.query_map([], |r| {
+                let id: String = r.get(0)?;
+                let fname: String = r.get(1)?;
+                Ok((id, fname))
+            })?;
+            mapped.filter_map(std::result::Result::ok).collect()
+        };
+        let mut deleted = 0u32;
+        for (engram_id, filename) in rows {
+            if !on_disk.contains(&filename)
+                && super::ingest::soft_delete_engram(&db, &engram_id).is_ok()
+            {
+                deleted += 1;
+            }
+        }
+
+        Ok(UpdateResult {
+            brain_id: id,
+            scanned,
+            ingested,
+            unchanged,
+            deleted,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Folder import (cold-start onboarding) — point at any directory of
+// markdown files (Obsidian vault, Notion export, Bear export, past
+// chat transcripts) and bulk-ingest them into the brain. Filenames
+// are namespaced by the source folder name so two imports with
+// overlapping basenames (two READMEs, etc.) don't collide.
+//
+// What this is NOT: it doesn't copy or symlink the source files. The
+// content goes into engrams.content; the original markdown stays
+// where it lives. If the source files later change, this won't
+// notice — re-run the import to refresh.
+//
+// Best-effort per file: a single bad UTF-8 file or permission error
+// is logged + counted, the rest of the import keeps going.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct ImportFolderBody {
+    /// Absolute path to the folder to walk.
+    path: String,
+    #[serde(default)]
+    brain: Option<String>,
+    /// Optional namespace prefix override. Default = source folder
+    /// basename. Pass "" to disable namespacing entirely (imports
+    /// land directly under their relative path).
+    #[serde(default)]
+    prefix: Option<String>,
+}
+
+#[derive(serde::Serialize, Default)]
+pub struct ImportFolderResult {
+    brain_id: String,
+    source_path: String,
+    prefix: String,
+    scanned: u32,
+    ingested: u32,
+    unchanged: u32,
+    errors: Vec<String>,
+    elapsed_ms: u64,
+}
+
+pub async fn import_folder(
+    _s: State<ServerState>,
+    Json(body): Json<ImportFolderBody>,
+) -> Result<Json<ImportFolderResult>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<ImportFolderResult, MemoryError> {
+        let started = std::time::Instant::now();
+        let root = std::path::PathBuf::from(&body.path);
+        if !root.is_dir() {
+            return Err(MemoryError::Other(format!(
+                "import path is not a directory: {}",
+                body.path
+            )));
+        }
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        let db = super::db::open_brain(&id)?;
+
+        // Default prefix: the source folder's basename. Caller can
+        // pass "" to suppress namespacing if they're confident their
+        // filenames won't collide with existing engrams.
+        let derived_prefix = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("import")
+            .to_string();
+        let prefix = body
+            .prefix
+            .clone()
+            .unwrap_or(derived_prefix)
+            .trim_matches('/')
+            .to_string();
+
+        let mut files = Vec::new();
+        collect_md_files(&root, &mut files);
+        let scanned = files.len() as u32;
+
+        let mut ingested = 0u32;
+        let mut unchanged = 0u32;
+        let mut errors: Vec<String> = Vec::new();
+
+        for path in &files {
+            let rel = match path.strip_prefix(&root) {
+                Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                Err(_) => path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            };
+            let ingest_filename = if prefix.is_empty() {
+                rel
+            } else {
+                format!("{}/{}", prefix, rel)
+            };
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    errors.push(format!("{}: {}", path.display(), e));
+                    continue;
+                }
+            };
+            // derive_personal = false: bulk-imported third-party docs are not
+            // the user's own preferences/facts. Deriving them here invented
+            // bogus `kind='preference'` engrams from quotes in imported books.
+            match super::ingest::ingest_content_opts(&ingest_filename, &content, &db, false) {
+                Ok(Some(_)) => ingested += 1,
+                Ok(None) => unchanged += 1,
+                Err(e) => errors.push(format!("{}: {}", path.display(), e)),
+            }
+        }
+
+        Ok(ImportFolderResult {
+            brain_id: id,
+            source_path: body.path,
+            prefix,
+            scanned,
+            ingested,
+            unchanged,
+            errors,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Graphify: codebase → on-device knowledge graph (see memory::graphify).
+// Parse a repo with tree-sitter, populate the code tables, then query the
+// symbol/call graph. Nothing leaves the machine.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct GraphifyBody {
+    pub path: String,
+    #[serde(default)]
+    pub brain: Option<String>,
+}
+
+/// POST /api/code/graphify — parse a repo into the brain's code graph.
+pub async fn code_graphify(
+    _s: State<ServerState>,
+    Json(body): Json<GraphifyBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let root = std::path::PathBuf::from(&body.path);
+        if !root.is_dir() {
+            return Err(MemoryError::Other(format!(
+                "graphify path is not a directory: {}",
+                body.path
+            )));
+        }
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        let db = open_brain(&id)?;
+        let started = std::time::Instant::now();
+        let stats = super::graphify::graphify_into_brain(&root, &db);
+        Ok(serde_json::json!({
+            "brain_id": id,
+            "path": body.path,
+            "files": stats.files,
+            "symbols": stats.symbols,
+            "calls": stats.calls,
+            "edges": stats.edges,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct CodeSymbolQuery {
+    pub symbol: String,
+    #[serde(default)]
+    pub brain_id: Option<String>,
+}
+
+/// GET /api/code/where_defined?symbol=&brain_id=
+pub async fn code_where_defined(
+    Query(q): Query<CodeSymbolQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(q.brain_id.as_deref())?;
+        let db = open_brain(&id)?;
+        let conn = db.lock();
+        let defs = super::graphify::where_defined(&conn, &q.symbol)?;
+        let rows: Vec<_> = defs
+            .into_iter()
+            .map(|(file, line)| serde_json::json!({ "file": file, "line": line }))
+            .collect();
+        Ok(serde_json::json!({ "symbol": q.symbol, "count": rows.len(), "definitions": rows }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+/// GET /api/code/who_calls?symbol=&brain_id=
+pub async fn code_who_calls(
+    Query(q): Query<CodeSymbolQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(q.brain_id.as_deref())?;
+        let db = open_brain(&id)?;
+        let conn = db.lock();
+        let callers = super::graphify::who_calls(&conn, &q.symbol)?;
+        let rows: Vec<_> = callers
+            .into_iter()
+            .map(|(caller, file, line)| {
+                serde_json::json!({ "caller": caller, "file": file, "line": line })
+            })
+            .collect();
+        Ok(serde_json::json!({ "symbol": q.symbol, "count": rows.len(), "callers": rows }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct CodeFileQuery {
+    pub path: String,
+    #[serde(default)]
+    pub brain_id: Option<String>,
+}
+
+/// GET /api/code/whats_in_file?path=&brain_id=
+pub async fn code_whats_in_file(
+    Query(q): Query<CodeFileQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(q.brain_id.as_deref())?;
+        let db = open_brain(&id)?;
+        let conn = db.lock();
+        let syms = super::graphify::whats_in_file(&conn, &q.path)?;
+        let rows: Vec<_> = syms
+            .into_iter()
+            .map(|(name, kind, signature)| {
+                serde_json::json!({ "name": name, "kind": kind, "signature": signature })
+            })
+            .collect();
+        Ok(serde_json::json!({ "path": q.path, "count": rows.len(), "symbols": rows }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+/// GET /api/code/blast_radius?symbol=&brain_id= — transitive callers (impact).
+pub async fn code_blast_radius(
+    Query(q): Query<CodeSymbolQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(q.brain_id.as_deref())?;
+        let db = open_brain(&id)?;
+        let conn = db.lock();
+        let impacted = super::graphify::blast_radius(&conn, &q.symbol)?;
+        let rows: Vec<_> = impacted
+            .into_iter()
+            .map(|(name, file, line)| {
+                serde_json::json!({ "name": name, "file": file, "line": line })
+            })
+            .collect();
+        Ok(serde_json::json!({ "symbol": q.symbol, "count": rows.len(), "impacted": rows }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct FuseBody {
+    #[serde(default)]
+    pub brain: Option<String>,
+}
+
+/// POST /api/code/fuse — link notes to the code symbols they reference.
+pub async fn code_fuse(
+    _s: State<ServerState>,
+    Json(body): Json<FuseBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        let db = open_brain(&id)?;
+        let conn = db.lock();
+        let links = super::graphify::fuse_notes_to_code(&conn)?;
+        Ok(serde_json::json!({ "brain_id": id, "links": links }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+// ---------------------------------------------------------------------------
+// Image listing for caption-at-ingest workflow.
+//
+// MCP can't do its own multimodal — the model behind the proxy is
+// the user's Claude Code / Desktop session, which IS multimodal.
+// So the captioning division of labour:
+//
+//   • This endpoint  — surface images the agent could caption.
+//   • The agent      — opens each image in its own context, writes
+//                      a caption, calls remember_image() (a thin
+//                      wrapper around remember) to persist it.
+//
+// No CV models, no API calls leaving the box. The agent is the
+// captioning model; the MCP server is the index + transport.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+pub struct ListImagesQuery {
+    folder_path: String,
+    #[serde(default = "default_true")]
+    recursive: bool,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ImageEntry {
+    path: String,
+    basename: String,
+    extension: String,
+    size_bytes: u64,
+    last_modified: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ListImagesResponse {
+    folder_path: String,
+    recursive: bool,
+    total: usize,
+    images: Vec<ImageEntry>,
+}
+
+pub const IMAGE_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "webp", "gif", "bmp", "svg", "heic", "tiff",
+];
+
+pub fn collect_image_files(
+    root: &std::path::Path,
+    recursive: bool,
+    out: &mut Vec<std::path::PathBuf>,
+    limit: usize,
+) {
+    if out.len() >= limit {
+        return;
+    }
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if out.len() >= limit {
+            return;
+        }
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            if recursive && name != "trash" {
+                collect_image_files(&path, true, out, limit);
+            }
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase());
+        if let Some(ext) = ext {
+            if IMAGE_EXTS.contains(&ext.as_str()) {
+                out.push(path);
+            }
+        }
+    }
+}
+
+pub async fn list_images(
+    Query(q): Query<ListImagesQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<ListImagesResponse>, ApiError> {
+    let root = std::path::PathBuf::from(&q.folder_path);
+    if !root.is_dir() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("not a directory: {}", q.folder_path),
+        ));
+    }
+    let limit = q.limit.unwrap_or(500).min(5000) as usize;
+    let result = tokio::task::spawn_blocking(move || -> Result<ListImagesResponse, MemoryError> {
+        let mut paths = Vec::new();
+        collect_image_files(&root, q.recursive, &mut paths, limit);
+        let mut images: Vec<ImageEntry> = Vec::with_capacity(paths.len());
+        for p in &paths {
+            let basename = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let extension = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default();
+            let meta = std::fs::metadata(p);
+            let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let last_modified = meta
+                .as_ref()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| {
+                    // ISO-ish; the agent only needs ordering / coarse age.
+                    let secs = d.as_secs();
+                    format!("{}", secs)
+                });
+            images.push(ImageEntry {
+                path: p.to_string_lossy().to_string(),
+                basename,
+                extension,
+                size_bytes,
+                last_modified,
+            });
+        }
+        let total = images.len();
+        Ok(ListImagesResponse {
+            folder_path: q.folder_path,
+            recursive: q.recursive,
+            total,
+            images,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Reindex embeddings — walk every active engram, re-chunk, re-embed
+// under the current model, replace chunks + vec_chunks rows. The
+// embedding upgrade path: when the user (or a future release) swaps
+// the BGE model for something larger, this is what reconciles the
+// vector store with the new model.
+//
+// Cost: roughly the same as the original ingest of every engram —
+// 5-10 ms per chunk on the BGE-small-en-v1.5 path. A 500-engram
+// brain with ~3 chunks each ≈ 7-15 seconds wall-clock.
+//
+// Idempotent under a stable model: encoding the same text twice
+// produces identical vectors, so a no-op re-run still rewrites the
+// same bytes. The work is the encode, not the disk IO.
+//
+// Per-engram failures are captured + counted; one bad engram
+// doesn't abort the rest. Run optimize_disk afterward if you want
+// the freed pages back.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+pub struct ReindexBody {
+    #[serde(default)]
+    brain: Option<String>,
+    /// Only count engrams that would be touched; skip the actual
+    /// re-embed work. Useful for sizing the wall-clock cost ahead
+    /// of time.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct ReindexResult {
+    brain_id: String,
+    dry_run: bool,
+    engrams_total: u32,
+    engrams_reembedded: u32,
+    chunks_written: u32,
+    failed: Vec<String>,
+    elapsed_ms: u64,
+}
+
+pub async fn reindex_embeddings(
+    _s: State<ServerState>,
+    body: Option<Json<ReindexBody>>,
+) -> Result<Json<ReindexResult>, ApiError> {
+    let body = body.map(|j| j.0).unwrap_or_default();
+    let result = tokio::task::spawn_blocking(move || -> Result<ReindexResult, MemoryError> {
+        let started = std::time::Instant::now();
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        let db = super::db::open_brain(&id)?;
+
+        let engram_ids: Vec<String> = {
+            let conn = db.lock();
+            let mut stmt =
+                conn.prepare("SELECT id FROM engrams WHERE state != 'dormant' ORDER BY id")?;
+            let mapped = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            mapped.filter_map(std::result::Result::ok).collect()
+        };
+        let total = engram_ids.len() as u32;
+
+        if body.dry_run {
+            return Ok(ReindexResult {
+                brain_id: id,
+                dry_run: true,
+                engrams_total: total,
+                engrams_reembedded: 0,
+                chunks_written: 0,
+                failed: Vec::new(),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            });
+        }
+
+        let mut reembedded = 0u32;
+        let mut chunks_written = 0u32;
+        let mut failed: Vec<String> = Vec::new();
+        for eid in &engram_ids {
+            match super::ingest::reembed_engram(&db, eid) {
+                Ok(n) => {
+                    if n > 0 {
+                        reembedded += 1;
+                        chunks_written += n;
+                    }
+                }
+                Err(e) => failed.push(format!("{}: {}", eid, e)),
+            }
+        }
+
+        // Reset recall caches — old vectors are gone, any cached
+        // ranking is stale.
+        super::recall_cache::invalidate_brain(&id);
+        let _ = super::bm25::index_for(&id).flush(&db);
+
+        Ok(ReindexResult {
+            brain_id: id,
+            dry_run: false,
+            engrams_total: total,
+            engrams_reembedded: reembedded,
+            chunks_written,
+            failed,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct RebuildWikilinksBody {
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct RebuildWikilinksResult {
+    brain_id: String,
+    engrams_processed: u32,
+    links_resolved: u32,
+    elapsed_ms: u64,
+}
+
+/// Re-resolve every `[[wikilink]]` in the brain in one pass. Fixes links
+/// that couldn't connect at write time — forward references (target written
+/// later) and titles with a parenthetical suffix the short link omits.
+pub async fn rebuild_wikilinks(
+    _s: State<ServerState>,
+    body: Option<Json<RebuildWikilinksBody>>,
+) -> Result<Json<RebuildWikilinksResult>, ApiError> {
+    let body = body.map(|j| j.0).unwrap_or_default();
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<RebuildWikilinksResult, MemoryError> {
+            let started = std::time::Instant::now();
+            let id = resolve_brain_id(body.brain.as_deref())?;
+            let db = super::db::open_brain(&id)?;
+            let (engrams_processed, links_resolved) = super::ingest::rebuild_wikilinks(&db)?;
+            super::recall_cache::invalidate_brain(&id);
+            Ok(RebuildWikilinksResult {
+                brain_id: id,
+                engrams_processed,
+                links_resolved,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            })
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Clutter report — surfaces engrams that look like noise so an agent
+// can review and remove. Four categories, one SQL query each:
+//
+//   stubs                  short content + low access count
+//   test_data              title pattern matches test/smoke/verify/debug
+//   forgotten_observations kind='observation' never accessed, >7 days old
+//   duplicate_titles       multiple non-dormant engrams sharing a title
+//
+// Returns categorised lists with reason hints so the caller can decide
+// per-engram. The matching `engrams_delete` endpoint takes an explicit
+// list of ids and soft-deletes them — no automatic deletion based on
+// the heuristics; an agent + human always confirms.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+pub struct ClutterQuery {
+    #[serde(default)]
+    brain: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ClutterEntry {
+    id: String,
+    title: String,
+    reason: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct ClutterReport {
+    brain_id: String,
+    stubs: Vec<ClutterEntry>,
+    test_data: Vec<ClutterEntry>,
+    forgotten_observations: Vec<ClutterEntry>,
+    duplicate_titles: Vec<ClutterEntry>,
+    total: usize,
+}
+
+pub async fn clutter_report(
+    Query(q): Query<ClutterQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<ClutterReport>, ApiError> {
+    let limit = q.limit.unwrap_or(50).min(500) as i64;
+    let result = tokio::task::spawn_blocking(move || -> Result<ClutterReport, MemoryError> {
+        let id = resolve_brain_id(q.brain.as_deref())?;
+        let db = open_brain(&id)?;
+        let conn = db.lock();
+
+        // Stubs: very short, never (or barely) accessed.
+        let stubs: Vec<ClutterEntry> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, title, length(content) AS len \
+                 FROM engrams \
+                 WHERE state != 'dormant' \
+                   AND length(content) < 100 \
+                   AND access_count <= 1 \
+                 ORDER BY length(content) ASC \
+                 LIMIT ?1",
+            )?;
+            let mapped = stmt.query_map([limit], |r| {
+                let id: String = r.get(0)?;
+                let title: String = r.get(1)?;
+                let len: i64 = r.get(2)?;
+                Ok(ClutterEntry {
+                    id,
+                    title,
+                    reason: format!("stub: {} chars of content", len),
+                })
+            })?;
+            mapped.filter_map(std::result::Result::ok).collect()
+        };
+
+        // Test data: title patterns suggesting throwaway content.
+        let test_data: Vec<ClutterEntry> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, title \
+                 FROM engrams \
+                 WHERE state != 'dormant' \
+                   AND ( lower(title) LIKE '%test%' \
+                      OR lower(title) LIKE '%smoke%' \
+                      OR lower(title) LIKE '%verify%' \
+                      OR lower(title) LIKE '%debug%' ) \
+                   AND access_count <= 1 \
+                 ORDER BY access_count ASC, created_at ASC \
+                 LIMIT ?1",
+            )?;
+            let mapped = stmt.query_map([limit], |r| {
+                let id: String = r.get(0)?;
+                let title: String = r.get(1)?;
+                Ok(ClutterEntry {
+                    id,
+                    title,
+                    reason: "test/verify/debug-titled, barely accessed".to_string(),
+                })
+            })?;
+            mapped.filter_map(std::result::Result::ok).collect()
+        };
+
+        // Forgotten observations: auto-extracted but never promoted.
+        let forgotten_observations: Vec<ClutterEntry> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, title, created_at \
+                 FROM engrams \
+                 WHERE state != 'dormant' \
+                   AND kind = 'observation' \
+                   AND access_count = 0 \
+                   AND created_at < datetime('now', '-7 days') \
+                 ORDER BY created_at ASC \
+                 LIMIT ?1",
+            )?;
+            let mapped = stmt.query_map([limit], |r| {
+                let id: String = r.get(0)?;
+                let title: String = r.get(1)?;
+                let created: String = r.get(2)?;
+                Ok(ClutterEntry {
+                    id,
+                    title,
+                    reason: format!("observation, never accessed, created {}", created),
+                })
+            })?;
+            mapped.filter_map(std::result::Result::ok).collect()
+        };
+
+        // Duplicate titles: any title that appears more than once.
+        let duplicate_titles: Vec<ClutterEntry> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, title \
+                 FROM engrams \
+                 WHERE state != 'dormant' \
+                   AND lower(title) IN ( \
+                     SELECT lower(title) FROM engrams \
+                     WHERE state != 'dormant' \
+                     GROUP BY lower(title) \
+                     HAVING count(*) > 1 ) \
+                 ORDER BY lower(title), created_at ASC \
+                 LIMIT ?1",
+            )?;
+            let mapped = stmt.query_map([limit], |r| {
+                let id: String = r.get(0)?;
+                let title: String = r.get(1)?;
+                Ok(ClutterEntry {
+                    id,
+                    title,
+                    reason: "duplicate title (one of multiple engrams)".to_string(),
+                })
+            })?;
+            mapped.filter_map(std::result::Result::ok).collect()
+        };
+
+        let total =
+            stubs.len() + test_data.len() + forgotten_observations.len() + duplicate_titles.len();
+        Ok(ClutterReport {
+            brain_id: id,
+            stubs,
+            test_data,
+            forgotten_observations,
+            duplicate_titles,
+            total,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(serde::Deserialize)]
+pub struct EngramsDeleteBody {
+    engram_ids: Vec<String>,
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct EngramsDeleteResult {
+    brain_id: String,
+    deleted: u32,
+    not_found: u32,
+    failed: Vec<String>,
+}
+
+pub async fn engrams_delete(
+    _s: State<ServerState>,
+    Json(body): Json<EngramsDeleteBody>,
+) -> Result<Json<EngramsDeleteResult>, ApiError> {
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<EngramsDeleteResult, MemoryError> {
+            let id = resolve_brain_id(body.brain.as_deref())?;
+            let vault = super::read_ops::resolve_vault_path(&id)?;
+            let ctx = super::write_ops::BrainContext::resolve(Some(&id), vault)?;
+
+            // Look up filename for each engram id, then call delete_note
+            // which also moves the markdown to trash/. The filename lookup
+            // and the delete are separate transactions; collecting the
+            // filenames first keeps the per-engram delete loop straight.
+            let mut filenames: Vec<(String, Option<String>)> = Vec::new();
+            {
+                let conn = ctx.db.lock();
+                for engram_id in &body.engram_ids {
+                    let row: Option<String> = conn
+                        .query_row(
+                            "SELECT filename FROM engrams WHERE id = ?1",
+                            [engram_id],
+                            |r| r.get(0),
+                        )
+                        .ok();
+                    filenames.push((engram_id.clone(), row));
+                }
+            }
+
+            let mut deleted = 0u32;
+            let mut not_found = 0u32;
+            let mut failed: Vec<String> = Vec::new();
+            for (engram_id, fname_opt) in filenames {
+                match fname_opt {
+                    None => not_found += 1,
+                    Some(fname) => match super::write_ops::delete_note(&ctx, &fname) {
+                        Ok(_) => deleted += 1,
+                        Err(e) => {
+                            eprintln!("[engrams_delete] {} ({}): {}", engram_id, fname, e);
+                            failed.push(engram_id);
+                        }
+                    },
+                }
+            }
+
+            Ok(EngramsDeleteResult {
+                brain_id: id,
+                deleted,
+                not_found,
+                failed,
+            })
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Bulk metadata edits — set `kind` or append a tag across many
+// engrams in one round-trip. The single-row path goes through the
+// markdown ingest (which re-runs frontmatter / chunk / embed), but
+// for kind/tag flips that's wasteful: nothing about the embedding
+// changes, so we update the engrams row directly + invalidate the
+// recall cache so the next query sees fresh metadata.
+//
+// Tags are stored as a JSON array string in `engrams.tags` (matches
+// the Python `dissertation.add_tag` convention). Tag input is
+// normalised: lowercase, trimmed, leading '#' stripped.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct BulkSetKindBody {
+    engram_ids: Vec<String>,
+    kind: String,
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct BulkUpdateResult {
+    brain_id: String,
+    updated: u32,
+    unchanged: u32,
+    not_found: Vec<String>,
+}
+
+pub async fn bulk_set_kind(
+    _s: State<ServerState>,
+    Json(body): Json<BulkSetKindBody>,
+) -> Result<Json<BulkUpdateResult>, ApiError> {
+    // Schema comment lists the canonical values. We don't reject
+    // unknown ones at the SQL level (the column is plain TEXT) but
+    // the API guards against typos.
+    const ALLOWED: &[&str] = &[
+        "note",
+        "source",
+        "quote",
+        "draft",
+        "question",
+        "decision",
+        "observation",
+        "insight",
+    ];
+    let kind = body.kind.trim().to_lowercase();
+    if !ALLOWED.contains(&kind.as_str()) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("kind must be one of {:?}, got {:?}", ALLOWED, body.kind),
+        ));
+    }
+    if body.engram_ids.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "engram_ids is empty".into(),
+        ));
+    }
+
+    let result = tokio::task::spawn_blocking(move || -> Result<BulkUpdateResult, MemoryError> {
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        let db = open_brain(&id)?;
+        let conn = db.lock();
+
+        let mut updated: u32 = 0;
+        let mut unchanged: u32 = 0;
+        let mut not_found: Vec<String> = Vec::new();
+        for eid in &body.engram_ids {
+            let existing: Option<String> = conn
+                .query_row("SELECT kind FROM engrams WHERE id = ?1", [eid], |r| {
+                    r.get(0)
+                })
+                .ok();
+            match existing {
+                None => not_found.push(eid.clone()),
+                Some(prev) if prev == kind => unchanged += 1,
+                Some(_) => {
+                    let n = conn.execute(
+                        "UPDATE engrams SET kind = ?1, updated_at = datetime('now') WHERE id = ?2",
+                        rusqlite::params![kind, eid],
+                    )?;
+                    if n > 0 {
+                        updated += 1;
+                    }
+                }
+            }
+        }
+        drop(conn);
+        super::recall_cache::invalidate_brain(&id);
+        Ok(BulkUpdateResult {
+            brain_id: id,
+            updated,
+            unchanged,
+            not_found,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(serde::Deserialize)]
+pub struct BulkAddTagBody {
+    engram_ids: Vec<String>,
+    tag: String,
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+pub async fn bulk_add_tag(
+    _s: State<ServerState>,
+    Json(body): Json<BulkAddTagBody>,
+) -> Result<Json<BulkUpdateResult>, ApiError> {
+    let tag = body.tag.trim().trim_start_matches('#').to_lowercase();
+    if tag.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "tag is empty".into()));
+    }
+    if body.engram_ids.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "engram_ids is empty".into(),
+        ));
+    }
+
+    let result = tokio::task::spawn_blocking(move || -> Result<BulkUpdateResult, MemoryError> {
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        let db = open_brain(&id)?;
+        let conn = db.lock();
+
+        let mut updated: u32 = 0;
+        let mut unchanged: u32 = 0;
+        let mut not_found: Vec<String> = Vec::new();
+        for eid in &body.engram_ids {
+            let existing: Option<Option<String>> = conn
+                .query_row("SELECT tags FROM engrams WHERE id = ?1", [eid], |r| {
+                    r.get(0)
+                })
+                .ok();
+            match existing {
+                None => not_found.push(eid.clone()),
+                Some(tags_json) => {
+                    let mut current: Vec<String> = tags_json
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or_default();
+                    if current.iter().any(|t| t == &tag) {
+                        unchanged += 1;
+                        continue;
+                    }
+                    current.push(tag.clone());
+                    let new_json = serde_json::to_string(&current)
+                        .map_err(|e| MemoryError::Other(format!("tag serialise: {e}")))?;
+                    conn.execute(
+                        "UPDATE engrams SET tags = ?1, updated_at = datetime('now') WHERE id = ?2",
+                        rusqlite::params![new_json, eid],
+                    )?;
+                    updated += 1;
+                }
+            }
+        }
+        drop(conn);
+        super::recall_cache::invalidate_brain(&id);
+        Ok(BulkUpdateResult {
+            brain_id: id,
+            updated,
+            unchanged,
+            not_found,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Engram version history — list past content snapshots for an engram
+// and fetch any individual version's content. Snapshots are written
+// by the ingest pipeline whenever `content_hash` changes, so the
+// list is sparse (no entry for no-op re-ingests) and only as deep as
+// the engram has actually been edited.
+//
+// version is a per-engram counter (1, 2, 3...). The CURRENT row
+// lives in `engrams`, not in `engram_versions` — version N here
+// means "N edits ago, this is what the engram said before being
+// replaced." Listing returns most-recent-first.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+pub struct EngramVersionsQuery {
+    #[serde(default)]
+    brain: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+pub struct EngramVersionRow {
+    version: i64,
+    title: String,
+    content_hash: String,
+    /// Content prefix for list view; full content fetched via the
+    /// per-version endpoint. Caps the list payload on a long
+    /// editing history.
+    content_preview: String,
+    content_bytes: i64,
+    created_at: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct EngramVersionsResponse {
+    brain_id: String,
+    engram_id: String,
+    current_title: String,
+    current_content_hash: String,
+    total: usize,
+    versions: Vec<EngramVersionRow>,
+}
+
+pub async fn engram_versions_list(
+    Path(engram_id): Path<String>,
+    Query(q): Query<EngramVersionsQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<EngramVersionsResponse>, ApiError> {
+    let limit = q.limit.unwrap_or(50).min(500) as i64;
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<EngramVersionsResponse, MemoryError> {
+            let id = resolve_brain_id(q.brain.as_deref())?;
+            let db = open_brain(&id)?;
+            let conn = db.lock();
+
+            let current: (String, String) = conn
+                .query_row(
+                    "SELECT title, content_hash FROM engrams WHERE id = ?1",
+                    [&engram_id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+                .map_err(|_| MemoryError::EngramNotFound(engram_id.clone()))?;
+
+            let mut stmt = conn.prepare(
+                "SELECT version, title, content, content_hash, created_at \
+             FROM engram_versions \
+             WHERE engram_id = ?1 \
+             ORDER BY version DESC \
+             LIMIT ?2",
+            )?;
+            let mapped = stmt.query_map(rusqlite::params![&engram_id, limit], |r| {
+                let content: String = r.get(2)?;
+                // Preview keeps the response cheap for long edit
+                // histories; callers fetch full content per-version.
+                let preview = content.chars().take(280).collect::<String>();
+                Ok(EngramVersionRow {
+                    version: r.get(0)?,
+                    title: r.get(1)?,
+                    content_hash: r.get(3)?,
+                    content_preview: preview,
+                    content_bytes: content.len() as i64,
+                    created_at: r.get(4)?,
+                })
+            })?;
+            let versions: Vec<EngramVersionRow> =
+                mapped.filter_map(std::result::Result::ok).collect();
+            let total = versions.len();
+            Ok(EngramVersionsResponse {
+                brain_id: id,
+                engram_id,
+                current_title: current.0,
+                current_content_hash: current.1,
+                total,
+                versions,
+            })
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(serde::Serialize)]
+pub struct EngramVersionDetail {
+    brain_id: String,
+    engram_id: String,
+    version: i64,
+    title: String,
+    content: String,
+    content_hash: String,
+    created_at: String,
+}
+
+pub async fn engram_version_get(
+    Path((engram_id, version)): Path<(String, i64)>,
+    Query(q): Query<EngramVersionsQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<EngramVersionDetail>, ApiError> {
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<EngramVersionDetail, MemoryError> {
+            let id = resolve_brain_id(q.brain.as_deref())?;
+            let db = open_brain(&id)?;
+            let conn = db.lock();
+            let row: (String, String, String, String) = conn
+                .query_row(
+                    "SELECT title, content, content_hash, created_at \
+                 FROM engram_versions \
+                 WHERE engram_id = ?1 AND version = ?2",
+                    rusqlite::params![&engram_id, version],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .map_err(|_| {
+                    MemoryError::Other(format!(
+                        "version {} not found for engram {}",
+                        version, engram_id
+                    ))
+                })?;
+            Ok(EngramVersionDetail {
+                brain_id: id,
+                engram_id,
+                version,
+                title: row.0,
+                content: row.1,
+                content_hash: row.2,
+                created_at: row.3,
+            })
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Contradictions endpoint — the review queue written by the conflict
+// sweep (`ingest::find_conflicts`, reached on demand via
+// /api/conflicts and via the diagnostic report).
+//
+// The comment that used to sit here claimed the ingest pipeline
+// auto-detected and stored these rows. It did not: the table had this
+// reader plus the resolve endpoint below, and no writer at all, so
+// both MCP tools reported an empty brain no matter what was in it.
+// The sweep now records what it finds.
+//
+// Rows are CANDIDATES, not confirmed contradictions. The detector is a
+// cosine band over document embeddings — it spots "same topic,
+// different note" and cannot tell agreement from disagreement. Each
+// row carries both notes and pointers back to their engrams so the
+// caller can read them and make the call.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+pub struct ContradictionsQuery {
+    /// Filter by resolution state. None → all rows. Some(false) →
+    /// only unresolved (the common case for "show me what to fix").
+    /// Some(true) → only resolved.
+    #[serde(default)]
+    resolved: Option<bool>,
+    #[serde(default)]
+    brain: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ContradictionEntry {
+    id: String,
+    fact_a: String,
+    fact_b: String,
+    engram_a_id: String,
+    engram_a_title: String,
+    engram_b_id: String,
+    engram_b_title: String,
+    detected_at: String,
+    resolved: bool,
+    resolution: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ContradictionsResponse {
+    brain_id: String,
+    total: usize,
+    contradictions: Vec<ContradictionEntry>,
+}
+
+/// Connection-level half of `contradictions_list`, split out so the
+/// sweep → persist → read loop can be exercised against an in-memory
+/// connection without standing up a real brain directory.
+pub(crate) fn contradiction_rows(
+    conn: &rusqlite::Connection,
+    resolved: Option<bool>,
+    limit: i64,
+) -> Result<Vec<ContradictionEntry>, MemoryError> {
+    let where_clause = match resolved {
+        None => "",
+        Some(true) => " WHERE c.resolved = 1",
+        Some(false) => " WHERE c.resolved = 0",
+    };
+    let sql = format!(
+        "SELECT c.id, c.fact_a, c.fact_b, \
+            c.engram_a, ea.title, \
+            c.engram_b, eb.title, \
+            c.detected_at, c.resolved, c.resolution \
+     FROM contradictions c \
+     JOIN engrams ea ON ea.id = c.engram_a \
+     JOIN engrams eb ON eb.id = c.engram_b \
+     {} \
+     ORDER BY c.detected_at DESC \
+     LIMIT ?1",
+        where_clause,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mapped = stmt.query_map([limit], |r| {
+        Ok(ContradictionEntry {
+            id: r.get(0)?,
+            fact_a: r.get(1)?,
+            fact_b: r.get(2)?,
+            engram_a_id: r.get(3)?,
+            engram_a_title: r.get(4)?,
+            engram_b_id: r.get(5)?,
+            engram_b_title: r.get(6)?,
+            detected_at: r.get(7)?,
+            resolved: r.get::<_, i64>(8)? != 0,
+            resolution: r.get(9)?,
+        })
+    })?;
+    Ok(mapped.filter_map(std::result::Result::ok).collect())
+}
+
+pub async fn contradictions_list(
+    Query(q): Query<ContradictionsQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<ContradictionsResponse>, ApiError> {
+    let limit = q.limit.unwrap_or(50).min(500) as i64;
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<ContradictionsResponse, MemoryError> {
+            let id = resolve_brain_id(q.brain.as_deref())?;
+            let db = open_brain(&id)?;
+            let conn = db.lock();
+            let contradictions = contradiction_rows(&conn, q.resolved, limit)?;
+            let total = contradictions.len();
+            Ok(ContradictionsResponse {
+                brain_id: id,
+                total,
+                contradictions,
+            })
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ContradictionResolveBody {
+    /// Optional human-readable note about why one fact wins or how
+    /// the conflict is reconciled. Stored verbatim. The endpoint just
+    /// flips the resolved flag — it does NOT delete or modify the
+    /// underlying engrams. Resolution is annotation, not action.
+    #[serde(default)]
+    resolution: Option<String>,
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ContradictionResolveResult {
+    id: String,
+    resolved: bool,
+}
+
+pub async fn contradictions_resolve(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    _s: State<ServerState>,
+    body: Option<Json<ContradictionResolveBody>>,
+) -> Result<Json<ContradictionResolveResult>, ApiError> {
+    let body = body.map(|j| j.0).unwrap_or(ContradictionResolveBody {
+        resolution: None,
+        brain: None,
+    });
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<ContradictionResolveResult, MemoryError> {
+            let brain_id = resolve_brain_id(body.brain.as_deref())?;
+            let db = open_brain(&brain_id)?;
+            let conn = db.lock();
+            let updated = conn.execute(
+                "UPDATE contradictions SET resolved = 1, resolution = ?2 WHERE id = ?1",
+                rusqlite::params![&id, &body.resolution],
+            )?;
+            if updated == 0 {
+                return Err(MemoryError::Other(format!(
+                    "contradiction {} not found",
+                    id
+                )));
+            }
+            Ok(ContradictionResolveResult { id, resolved: true })
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Manual link management — lets agents wire engrams together AFTER
+// the initial save. The ingest pipeline auto-creates links from
+// embedded [[wikilinks]] and entity co-mentions, but until v0.1.9
+// there was no MCP-accessible way to add a link without rewriting
+// the markdown body. Two endpoints: POST adds (with bidirectional
+// flag, default true), DELETE removes.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct LinkBody {
+    from_engram: String,
+    to_engram: String,
+    /// "manual" by default — matches what wikilinks resolve to.
+    /// Other valid values: "uses", "extends", "depends_on",
+    /// "contradicts", "supersedes", or any string the agent wants
+    /// to use (the `link_type` column is free-form TEXT).
+    #[serde(default)]
+    link_type: Option<String>,
+    /// 1.0 by default for manual edges (matches wikilink convention).
+    /// Lower values (0.7-0.9) make sense for weaker manual links.
+    #[serde(default)]
+    similarity: Option<f64>,
+    /// True by default. When true, also inserts the reverse edge so
+    /// adjacency / hover-focus / `related()` see the connection from
+    /// both sides. Matches what the wikilink pipeline does. Set
+    /// false for asymmetric relationships ("A supersedes B" → not
+    /// "B supersedes A").
+    #[serde(default)]
+    bidirectional: Option<bool>,
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct LinkResult {
+    brain_id: String,
+    from_engram: String,
+    to_engram: String,
+    link_type: String,
+    similarity: f64,
+    bidirectional: bool,
+    /// 1 when only the forward edge was inserted (or replaced),
+    /// 2 when the reverse was inserted as well.
+    rows_written: u32,
+}
+
+pub async fn links_add(
+    _s: State<ServerState>,
+    Json(body): Json<LinkBody>,
+) -> Result<Json<LinkResult>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<LinkResult, MemoryError> {
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        let db = open_brain(&id)?;
+        let link_type = body.link_type.unwrap_or_else(|| "manual".to_string());
+        let similarity = body.similarity.unwrap_or(1.0).clamp(0.0, 1.0);
+        let bidirectional = body.bidirectional.unwrap_or(true);
+
+        let conn = db.lock();
+
+        // Validate both engrams exist before writing — INSERT OR
+        // REPLACE without a ref check would silently create dangling
+        // edges if the agent typo'd an id.
+        let exists_a: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM engrams WHERE id = ?1",
+            [&body.from_engram],
+            |r| r.get(0),
+        )?;
+        let exists_b: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM engrams WHERE id = ?1",
+            [&body.to_engram],
+            |r| r.get(0),
+        )?;
+        if exists_a == 0 {
+            return Err(MemoryError::EngramNotFound(body.from_engram.clone()));
+        }
+        if exists_b == 0 {
+            return Err(MemoryError::EngramNotFound(body.to_engram.clone()));
+        }
+
+        conn.execute(
+            "INSERT OR REPLACE INTO engram_links \
+             (from_engram, to_engram, similarity, link_type) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![&body.from_engram, &body.to_engram, similarity, &link_type],
+        )?;
+        let mut rows_written = 1u32;
+        if bidirectional && body.from_engram != body.to_engram {
+            conn.execute(
+                "INSERT OR REPLACE INTO engram_links \
+                 (from_engram, to_engram, similarity, link_type) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![&body.to_engram, &body.from_engram, similarity, &link_type],
+            )?;
+            rows_written = 2;
+        }
+
+        Ok(LinkResult {
+            brain_id: id,
+            from_engram: body.from_engram,
+            to_engram: body.to_engram,
+            link_type,
+            similarity,
+            bidirectional,
+            rows_written,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(serde::Deserialize)]
+pub struct LinkRemoveBody {
+    from_engram: String,
+    to_engram: String,
+    /// True by default — also removes the reverse edge if present,
+    /// matching the bidirectional add flow.
+    #[serde(default)]
+    bidirectional: Option<bool>,
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct LinkRemoveResult {
+    brain_id: String,
+    rows_deleted: u32,
+}
+
+pub async fn links_remove(
+    _s: State<ServerState>,
+    Json(body): Json<LinkRemoveBody>,
+) -> Result<Json<LinkRemoveResult>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<LinkRemoveResult, MemoryError> {
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        let db = open_brain(&id)?;
+        let bidirectional = body.bidirectional.unwrap_or(true);
+        let conn = db.lock();
+        let mut rows_deleted = conn.execute(
+            "DELETE FROM engram_links WHERE from_engram = ?1 AND to_engram = ?2",
+            rusqlite::params![&body.from_engram, &body.to_engram],
+        )? as u32;
+        if bidirectional && body.from_engram != body.to_engram {
+            rows_deleted += conn.execute(
+                "DELETE FROM engram_links WHERE from_engram = ?1 AND to_engram = ?2",
+                rusqlite::params![&body.to_engram, &body.from_engram],
+            )? as u32;
+        }
+        Ok(LinkRemoveResult {
+            brain_id: id,
+            rows_deleted,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Orphan links — pairs the system knows are semantically related
+// (cosine ≥ threshold from the auto-similarity pass) but the user
+// has never explicitly wikilinked. Surface them so an agent can
+// propose: "these two notes are very similar, want to connect them
+// with `add_link()`?" Reuses the existing engram_links table — no
+// new computation, just a NOT EXISTS subquery.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+pub struct OrphanLinksQuery {
+    /// Minimum semantic similarity to consider. Default 0.85 (matches
+    /// the graph view's default min_similarity). Lowering surfaces
+    /// noisier candidates; raising tightens to "almost certainly
+    /// related."
+    #[serde(default)]
+    threshold: Option<f64>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct OrphanLinkEntry {
+    engram_a_id: String,
+    engram_a_title: String,
+    engram_b_id: String,
+    engram_b_title: String,
+    similarity: f64,
+}
+
+#[derive(serde::Serialize)]
+pub struct OrphanLinksResponse {
+    brain_id: String,
+    threshold: f64,
+    total: usize,
+    pairs: Vec<OrphanLinkEntry>,
+}
+
+pub async fn orphan_links(
+    Query(q): Query<OrphanLinksQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<OrphanLinksResponse>, ApiError> {
+    let threshold = q.threshold.unwrap_or(0.85).clamp(0.0, 1.0);
+    let limit = q.limit.unwrap_or(50).min(500) as i64;
+    let result = tokio::task::spawn_blocking(move || -> Result<OrphanLinksResponse, MemoryError> {
+        let id = resolve_brain_id(q.brain.as_deref())?;
+        let db = open_brain(&id)?;
+        let conn = db.lock();
+
+        // Each unordered pair appears twice in engram_links
+        // (A→B + B→A from the bidirectional insert). De-dup with
+        // `s.from_engram < s.to_engram` so the response only carries
+        // each pair once.
+        //
+        // The NOT EXISTS subquery rules out pairs that already have
+        // any manually-asserted relationship in EITHER direction:
+        // manual / uses / extends / depends_on / supersedes /
+        // contradicts. Those aren't orphans — they're done.
+        let mut stmt = conn.prepare(
+            "SELECT s.from_engram, ea.title, s.to_engram, eb.title, s.similarity \
+             FROM engram_links s \
+             JOIN engrams ea ON ea.id = s.from_engram \
+             JOIN engrams eb ON eb.id = s.to_engram \
+             WHERE s.link_type = 'semantic' \
+               AND s.similarity >= ?1 \
+               AND s.from_engram < s.to_engram \
+               AND ea.state != 'dormant' AND eb.state != 'dormant' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM engram_links m \
+                 WHERE ((m.from_engram = s.from_engram AND m.to_engram = s.to_engram) \
+                     OR (m.from_engram = s.to_engram AND m.to_engram = s.from_engram)) \
+                   AND m.link_type IN ('manual','uses','extends','depends_on','supersedes','contradicts') \
+               ) \
+             ORDER BY s.similarity DESC \
+             LIMIT ?2",
+        )?;
+        let mapped = stmt.query_map(rusqlite::params![threshold, limit], |r| {
+            Ok(OrphanLinkEntry {
+                engram_a_id: r.get(0)?,
+                engram_a_title: r.get(1)?,
+                engram_b_id: r.get(2)?,
+                engram_b_title: r.get(3)?,
+                similarity: r.get(4)?,
+            })
+        })?;
+        let pairs: Vec<OrphanLinkEntry> = mapped.filter_map(std::result::Result::ok).collect();
+        let total = pairs.len();
+        Ok(OrphanLinksResponse {
+            brain_id: id,
+            threshold,
+            total,
+            pairs,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Temporal recall — surface rows from `temporal_facts`, optionally as
+// of a past instant. The retriever already biases live recall against
+// superseded facts; this endpoint lets an agent ask the bitemporal
+// table directly: "what did I believe about X" or "what did I believe
+// about X on date Y?". Two time axes:
+//
+//   • valid time   — the period the fact described reality
+//                    [valid_from, valid_until)
+//   • system time  — when we knew the fact; `expired_at` is set when
+//                    we *retracted* the row (vs. simply ending its
+//                    valid interval).
+//
+// `as_of` filters on valid time + system time together: the fact's
+// valid interval must contain `as_of`, AND the row must not have been
+// retracted before `as_of`. So the response is exactly the set of
+// facts the system would have asserted at that moment.
+//
+// `include_superseded=true` drops the validity filter and returns
+// every matching row, current or not — useful when the agent is
+// auditing the history of a topic ("show me the full timeline for
+// the database choice").
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+pub struct TemporalRecallQuery {
+    /// Free-text substring matched against `fact`. Case-insensitive.
+    /// Empty / missing returns the most recent facts in the brain.
+    #[serde(default)]
+    query: Option<String>,
+    /// ISO timestamp ("2026-01-15" or "2026-01-15T12:00:00") to time-
+    /// travel to. Default = now (only currently-valid facts).
+    #[serde(default)]
+    as_of: Option<String>,
+    /// If set, scope to facts attached to this engram only.
+    #[serde(default)]
+    engram_id: Option<String>,
+    /// When true, ignore the validity filter and return every match —
+    /// current, ended, and retracted alike.
+    #[serde(default)]
+    include_superseded: bool,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct TemporalFactEntry {
+    id: String,
+    engram_id: String,
+    engram_title: String,
+    fact: String,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
+    is_current: bool,
+    superseded_by: Option<String>,
+    expired_at: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct TemporalRecallResponse {
+    brain_id: String,
+    query: String,
+    as_of: Option<String>,
+    include_superseded: bool,
+    total: usize,
+    facts: Vec<TemporalFactEntry>,
+}
+
+pub async fn temporal_recall(
+    Query(q): Query<TemporalRecallQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<TemporalRecallResponse>, ApiError> {
+    let limit = q.limit.unwrap_or(50).min(500) as i64;
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<TemporalRecallResponse, MemoryError> {
+            let id = resolve_brain_id(q.brain.as_deref())?;
+            let db = open_brain(&id)?;
+            let conn = db.lock();
+
+            let query_text = q.query.unwrap_or_default();
+            let like_pat = format!("%{}%", query_text);
+            let has_query = !query_text.is_empty();
+            let has_engram = q.engram_id.is_some();
+
+            // Two SQL shapes: time-travel vs. live. The bitemporal filter
+            // matches on validity AND system-time (`expired_at` either NULL
+            // or in the future relative to `as_of`). When the caller passes
+            // `include_superseded`, we drop both filters and return raw
+            // history.
+            let mut sql = String::from(
+                "SELECT t.id, t.engram_id, e.title, t.fact, t.valid_from, t.valid_until, \
+                    t.is_current, t.superseded_by, t.expired_at \
+             FROM temporal_facts t \
+             JOIN engrams e ON e.id = t.engram_id \
+             WHERE e.state != 'dormant'",
+            );
+            let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+
+            if !q.include_superseded {
+                if let Some(ref cutoff) = q.as_of {
+                    sql.push_str(
+                        " AND (t.valid_from IS NULL OR t.valid_from <= ?) \
+                       AND (t.valid_until IS NULL OR t.valid_until > ?) \
+                       AND (t.expired_at IS NULL OR t.expired_at > ?)",
+                    );
+                    binds.push(rusqlite::types::Value::Text(cutoff.clone()));
+                    binds.push(rusqlite::types::Value::Text(cutoff.clone()));
+                    binds.push(rusqlite::types::Value::Text(cutoff.clone()));
+                } else {
+                    sql.push_str(" AND t.is_current = 1 AND t.expired_at IS NULL");
+                }
+            }
+
+            if has_query {
+                sql.push_str(" AND t.fact LIKE ? COLLATE NOCASE");
+                binds.push(rusqlite::types::Value::Text(like_pat));
+            }
+            if has_engram {
+                sql.push_str(" AND t.engram_id = ?");
+                binds.push(rusqlite::types::Value::Text(
+                    q.engram_id.clone().unwrap_or_default(),
+                ));
+            }
+
+            // Most-recent first by valid_from; ties broken by id for
+            // stable pagination.
+            sql.push_str(" ORDER BY COALESCE(t.valid_from, '') DESC, t.id ASC LIMIT ?");
+            binds.push(rusqlite::types::Value::Integer(limit));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let mapped = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                let is_current_int: i64 = r.get(6)?;
+                Ok(TemporalFactEntry {
+                    id: r.get(0)?,
+                    engram_id: r.get(1)?,
+                    engram_title: r.get(2)?,
+                    fact: r.get(3)?,
+                    valid_from: r.get(4)?,
+                    valid_until: r.get(5)?,
+                    is_current: is_current_int != 0,
+                    superseded_by: r.get(7)?,
+                    expired_at: r.get(8)?,
+                })
+            })?;
+            let facts: Vec<TemporalFactEntry> =
+                mapped.filter_map(std::result::Result::ok).collect();
+            let total = facts.len();
+            Ok(TemporalRecallResponse {
+                brain_id: id,
+                query: query_text,
+                as_of: q.as_of,
+                include_superseded: q.include_superseded,
+                total,
+                facts,
+            })
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Disk optimization — reclaim brain.db space. Three composable
+// operations:
+//
+//   1. purge_dormant  — hard-delete every engram with state='dormant'.
+//                       Soft delete already strips chunks + vec rows
+//                       and link rows; cascade FKs handle the rest.
+//                       Off by default (destructive).
+//   2. wal_checkpoint — flush the WAL into the main DB and truncate
+//                       the WAL file to zero. Recovers space the WAL
+//                       was holding for crash safety.
+//   3. vacuum         — rebuild the DB file removing free pages from
+//                       prior deletes. Most expensive op (rewrites
+//                       the whole file) but biggest reclaim on a
+//                       brain that has churned through deletes.
+//
+// On the user's 90 MB brain, ~10-25 MB are typically reclaimable:
+// soft-deleted engrams sit as free pages until VACUUM runs, and the
+// WAL accumulates without a checkpoint trigger if writes are sparse.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+pub struct OptimizeDiskBody {
+    #[serde(default)]
+    brain: Option<String>,
+    /// Hard-delete every dormant engram. Default false because this
+    /// is irreversible — the soft-delete trail is gone after this.
+    #[serde(default)]
+    purge_dormant: bool,
+    /// Default true — cheap, almost always wanted.
+    #[serde(default = "default_true")]
+    wal_checkpoint: bool,
+    /// Default true — the actual disk reclaim. Rewrite cost is linear
+    /// in brain size; on a 90 MB brain ≈ 1-3s.
+    #[serde(default = "default_true")]
+    vacuum: bool,
+}
+
+pub fn default_true() -> bool {
+    true
+}
+
+#[derive(serde::Serialize)]
+pub struct DiskMeasurement {
+    db_bytes: u64,
+    wal_bytes: u64,
+    shm_bytes: u64,
+    total_bytes: u64,
+    free_pages: i64,
+    page_size: i64,
+}
+
+#[derive(serde::Serialize)]
+pub struct OptimizeRan {
+    purge_dormant: bool,
+    wal_checkpoint: bool,
+    vacuum: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct OptimizeDiskResponse {
+    brain_id: String,
+    before: DiskMeasurement,
+    after: DiskMeasurement,
+    reclaimed_bytes: i64,
+    purged_engrams: u32,
+    ran: OptimizeRan,
+}
+
+pub async fn optimize_disk(
+    _s: State<ServerState>,
+    Json(body): Json<OptimizeDiskBody>,
+) -> Result<Json<OptimizeDiskResponse>, ApiError> {
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<OptimizeDiskResponse, MemoryError> {
+            let id = resolve_brain_id(body.brain.as_deref())?;
+            let dir = super::paths::brain_dir(&id);
+
+            let measure = |conn: &rusqlite::Connection| -> Result<DiskMeasurement, MemoryError> {
+                let db_bytes = std::fs::metadata(dir.join("brain.db"))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let wal_bytes = std::fs::metadata(dir.join("brain.db-wal"))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let shm_bytes = std::fs::metadata(dir.join("brain.db-shm"))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let free_pages: i64 = conn
+                    .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+                    .unwrap_or(0);
+                let page_size: i64 = conn
+                    .query_row("PRAGMA page_size", [], |r| r.get(0))
+                    .unwrap_or(4096);
+                Ok(DiskMeasurement {
+                    db_bytes,
+                    wal_bytes,
+                    shm_bytes,
+                    total_bytes: db_bytes + wal_bytes + shm_bytes,
+                    free_pages,
+                    page_size,
+                })
+            };
+
+            let db = open_brain(&id)?;
+            let before = {
+                let conn = db.lock();
+                measure(&conn)?
+            };
+
+            // Step 1: hard-delete dormant rows. CASCADE FKs reap chunks /
+            // links / entity_mentions / contradictions / temporal_facts
+            // automatically. vec_chunks were already cleared at soft-
+            // delete time, so no orphan rows remain.
+            let mut purged: u32 = 0;
+            if body.purge_dormant {
+                let conn = db.lock();
+                // Returning rowcount from execute would conflate the
+                // engram delete with cascaded child deletes; query the
+                // count first so the response is meaningful.
+                let dormant: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM engrams WHERE state = 'dormant'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                conn.execute("DELETE FROM engrams WHERE state = 'dormant'", [])?;
+                purged = dormant as u32;
+            }
+
+            // Step 2: VACUUM first. Cannot run inside a transaction;
+            // execute_batch doesn't open one. Clearing the statement
+            // cache avoids any prepared-statement contention with the
+            // file rewrite.
+            //
+            // VACUUM has to come BEFORE the checkpoint because VACUUM
+            // itself writes the entire rebuilt DB through the WAL. If
+            // we checkpoint first and VACUUM second, the WAL ends up
+            // bigger than the DB. Inverting the order so checkpoint
+            // truncates VACUUM's WAL output too.
+            if body.vacuum {
+                let conn = db.lock();
+                conn.flush_prepared_statement_cache();
+                conn.execute_batch("VACUUM;")?;
+            }
+
+            // Step 3: WAL truncate. PASSIVE would just flush; TRUNCATE
+            // also shrinks the file back to zero bytes. Safe — we hold
+            // the only writer lock and there are no in-flight readers
+            // because the connection is mutex-guarded.
+            if body.wal_checkpoint {
+                let conn = db.lock();
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            }
+
+            let after = {
+                let conn = db.lock();
+                measure(&conn)?
+            };
+
+            // Invalidate the recall cache + bm25 index — purged dormants
+            // were already excluded from those, but a VACUUM reorders
+            // pages and we want fresh handles next call.
+            super::recall_cache::invalidate_brain(&id);
+            let _ = super::bm25::index_for(&id).flush(&db);
+
+            let reclaimed = before.total_bytes as i64 - after.total_bytes as i64;
+            Ok(OptimizeDiskResponse {
+                brain_id: id,
+                before,
+                after,
+                reclaimed_bytes: reclaimed,
+                purged_engrams: purged,
+                ran: OptimizeRan {
+                    purge_dormant: body.purge_dormant,
+                    wal_checkpoint: body.wal_checkpoint,
+                    vacuum: body.vacuum,
+                },
+            })
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// MCP tier — read/write `~/.neurovault/mcp_tier.txt`. The Python MCP
+// proxy reads this at startup to decide which tools to register, so
+// changing the tier here only takes effect after the proxy restarts
+// (the desktop app surfaces this with a "restart MCP" hint after a
+// PUT). Stored as a plain text file rather than a row in any DB so
+// the proxy can read it before importing anything heavy.
+//
+// Allowed: "lite" | "standard" | "full". Anything else (including
+// missing file) is treated as "full" by the proxy.
+// ---------------------------------------------------------------------------
+
+pub fn mcp_tier_path() -> std::path::PathBuf {
+    super::paths::nv_home().join("mcp_tier.txt")
+}
+
+#[derive(serde::Serialize)]
+pub struct McpTierResponse {
+    tier: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct McpTierBody {
+    tier: String,
+}
+
+pub async fn mcp_tier_get(_s: State<ServerState>) -> Result<Json<McpTierResponse>, ApiError> {
+    let raw = std::fs::read_to_string(mcp_tier_path()).unwrap_or_default();
+    let trimmed = raw.trim().to_lowercase();
+    let tier = match trimmed.as_str() {
+        "lite" => "lite",
+        "standard" => "standard",
+        _ => "full",
+    };
+    Ok(Json(McpTierResponse {
+        tier: tier.to_string(),
+    }))
+}
+
+pub async fn mcp_tier_set(
+    _s: State<ServerState>,
+    Json(body): Json<McpTierBody>,
+) -> Result<Json<McpTierResponse>, ApiError> {
+    let trimmed = body.tier.trim().to_lowercase();
+    if !matches!(trimmed.as_str(), "lite" | "standard" | "full") {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "tier must be 'lite' | 'standard' | 'full', got {:?}",
+                body.tier
+            ),
+        ));
+    }
+    let path = mcp_tier_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&path, &trimmed).map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write tier: {e}"),
+        )
+    })?;
+    Ok(Json(McpTierResponse { tier: trimmed }))
+}
+
+// ---------------------------------------------------------------------------
+// Reranker default — ~/.neurovault/rerank.txt. The cross-encoder reranker
+// lifts LongMemEval hit@5 from ~94% (retrieval only) to ~97%, but it loads a
+// ~1 GB model and adds ~50-100 ms per recall. ON by default; the Settings
+// toggle writes "off" for a lighter, faster app at a small recall cost. Read
+// as the default for the recall path's `rerank` param (an explicit per-call
+// `rerank` still wins).
+// ---------------------------------------------------------------------------
+
+pub fn rerank_pref_path() -> std::path::PathBuf {
+    super::paths::nv_home().join("rerank.txt")
+}
+
+/// Default reranker state for recall: OPT-IN.
+///
+/// It used to default ON when the pref file was absent — i.e. on every
+/// fresh install. The cross-encoder is worth it (+3.8pp hit@5) but its
+/// model is ~1.1 GB, the download emits no progress anywhere the user can
+/// see, and it is triggered by typing a search. So a brand-new user's
+/// first query bought them several minutes of an app that appeared to do
+/// nothing. "No pref file" means "this user has never been asked", and
+/// nobody who has never been asked should be signed up for a gigabyte.
+/// An explicit `on` (Settings → Reranker) still enables it, unchanged.
+pub fn rerank_enabled() -> bool {
+    rerank_enabled_at(&rerank_pref_path())
+}
+
+/// Body of [`rerank_enabled`] against an explicit path, so the default can
+/// be pinned by a test without redirecting the process-global
+/// NEUROVAULT_HOME (which races every other test that reads it).
+fn rerank_enabled_at(path: &std::path::Path) -> bool {
+    match std::fs::read_to_string(path) {
+        // An empty file is a half-written pref, not consent — same
+        // treatment as no file at all.
+        Ok(s) if s.trim().is_empty() => false,
+        Ok(s) => !matches!(s.trim().to_lowercase().as_str(), "off" | "false" | "0"),
+        Err(_) => false,
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct RerankResponse {
+    enabled: bool,
+}
+
+#[derive(serde::Deserialize)]
+pub struct RerankBody {
+    enabled: bool,
+}
+
+pub async fn rerank_get(_s: State<ServerState>) -> Result<Json<RerankResponse>, ApiError> {
+    Ok(Json(RerankResponse {
+        enabled: rerank_enabled(),
+    }))
+}
+
+pub async fn rerank_set(
+    _s: State<ServerState>,
+    Json(body): Json<RerankBody>,
+) -> Result<Json<RerankResponse>, ApiError> {
+    let path = rerank_pref_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&path, if body.enabled { "on" } else { "off" }).map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write rerank: {e}"),
+        )
+    })?;
+    Ok(Json(RerankResponse {
+        enabled: body.enabled,
+    }))
+}
+
+#[cfg(test)]
+mod rerank_pref_tests {
+    use super::rerank_enabled_at;
+
+    /// A path that is guaranteed not to exist — the state of every fresh
+    /// install. Tested against `rerank_enabled_at` rather than
+    /// `rerank_enabled` so we don't have to redirect the process-global
+    /// NEUROVAULT_HOME, which races every other test that reads it.
+    fn absent() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "nv-rerank-absent-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    #[test]
+    fn a_fresh_install_does_not_opt_into_a_gigabyte_download() {
+        assert!(
+            !rerank_enabled_at(&absent()),
+            "no pref file = a user who has never been asked; \
+             they must not silently pull a ~1.1 GB model"
+        );
+    }
+
+    #[test]
+    fn the_pref_file_still_decides_in_both_directions() {
+        let p = absent();
+        std::fs::write(&p, "on").unwrap();
+        assert!(rerank_enabled_at(&p), "an explicit opt-in must enable it");
+        std::fs::write(&p, "true").unwrap();
+        assert!(rerank_enabled_at(&p));
+        // Every spelling the Settings toggle and hand-edits produce.
+        for spelling in ["off", "false", "0", "OFF", " off \n", ""] {
+            std::fs::write(&p, spelling).unwrap();
+            assert!(!rerank_enabled_at(&p), "{spelling:?} must read as off");
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Automatic consolidation — ~/.neurovault/consolidation_auto.txt. The clock in
+// `memory::consolidation_schedule` runs `adaptive::consolidate::run_proposal`
+// for the active brain every few hours. ON by default, unlike the AI-employee
+// scheduler, because a proposal run is INERT: it only appends Unreviewed /
+// Pending records to the review store. Nothing it produces touches an engram
+// until a human clicks Approve in MemoryReview (`proposal_approve` above is the
+// sole executor). The toggle writes "off" for users who want an empty queue.
+// ---------------------------------------------------------------------------
+
+pub fn consolidation_auto_pref_path() -> std::path::PathBuf {
+    super::paths::nv_home().join("consolidation_auto.txt")
+}
+
+/// Whether the consolidation clock may run. ON unless the user wrote "off".
+pub fn consolidation_auto_enabled() -> bool {
+    match std::fs::read_to_string(consolidation_auto_pref_path()) {
+        Ok(s) => !matches!(s.trim().to_lowercase().as_str(), "off" | "false" | "0"),
+        Err(_) => true,
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct ConsolidationAutoResponse {
+    enabled: bool,
+    interval_hours: i64,
+}
+
+#[derive(serde::Deserialize)]
+pub struct ConsolidationAutoBody {
+    enabled: bool,
+}
+
+pub async fn consolidation_auto_get(
+    _s: State<ServerState>,
+) -> Result<Json<ConsolidationAutoResponse>, ApiError> {
+    Ok(Json(ConsolidationAutoResponse {
+        enabled: consolidation_auto_enabled(),
+        interval_hours: super::consolidation_schedule::RUN_INTERVAL_HOURS,
+    }))
+}
+
+pub async fn consolidation_auto_set(
+    _s: State<ServerState>,
+    Json(body): Json<ConsolidationAutoBody>,
+) -> Result<Json<ConsolidationAutoResponse>, ApiError> {
+    let path = consolidation_auto_pref_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&path, if body.enabled { "on" } else { "off" }).map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write consolidation_auto: {e}"),
+        )
+    })?;
+    Ok(Json(ConsolidationAutoResponse {
+        enabled: body.enabled,
+        interval_hours: super::consolidation_schedule::RUN_INTERVAL_HOURS,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Local memory curator — ~/.neurovault/local_curator.json plus the run,
+// audit and span-preview endpoints (guide §2.8/§3.5, spec §13–§18).
+//
+// Four routes, all loopback like everything else here:
+//
+//   GET/PUT /api/local_curator          consent + provider + clock state
+//   POST    /api/curator/run            manual run (409 while one is in flight)
+//   GET     /api/curator/runs           the per-unit audit ledger
+//   GET     /api/curator/span_preview   re-verified sentence text for a card
+//
+// The consent booleans are *read* through the curator's single consent
+// loader, never re-parsed here; this module only writes the file the
+// loader reads.
+// ---------------------------------------------------------------------------
+
+use super::adaptive::curator::{runner as curator_runner, schedule as curator_schedule};
+
+fn local_curator_path() -> std::path::PathBuf {
+    super::paths::nv_home().join("local_curator.json")
+}
+
+/// The file as JSON, so a PUT can patch the keys it knows and leave
+/// every other key exactly where it found it (a future `provider`
+/// sub-field must survive a consent toggle written by an older build).
+fn local_curator_raw() -> serde_json::Value {
+    std::fs::read_to_string(local_curator_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// The settings panel aborts its GET after 5 s, so the probe has to come
+/// back well inside that: a hung Ollama must render as "unreachable",
+/// not as "NeuroVault is offline".
+const PROBE_TIMEOUT_SECS: u64 = 3;
+
+/// Read-only `/api/tags` probe: which models this Ollama already has.
+///
+/// Listing is not pulling. Nothing in the curator downloads a model —
+/// Settings shows what is installed and the user installs the rest
+/// themselves. A probe failure is reported as a *status*, never as an
+/// error: the settings page has to render with Ollama switched off.
+async fn probe_provider(
+    cfg: &super::adaptive::curator::provider::ProviderConfig,
+) -> (Vec<serde_json::Value>, serde_json::Value) {
+    use super::adaptive::curator::provider::{self, ProviderError};
+
+    let status = |e: ProviderError| serde_json::json!({ "ok": false, "code": e.code(), "hint": e.user_hint() });
+    let base = match cfg.base_url() {
+        Ok(base) => base,
+        Err(e) => return (Vec::new(), status(e)),
+    };
+    let client = provider::client(cfg);
+    let response = client
+        .get(format!("{base}/api/tags"))
+        .timeout(std::time::Duration::from_secs(
+            cfg.timeout_control_secs.clamp(1, PROBE_TIMEOUT_SECS),
+        ))
+        .send()
+        .await;
+    let body = match response {
+        Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
+        Ok(r) => {
+            return (
+                Vec::new(),
+                status(ProviderError::HttpStatus {
+                    status: r.status().as_u16(),
+                }),
+            )
+        }
+        Err(e) => {
+            return (
+                Vec::new(),
+                status(ProviderError::OllamaUnreachable {
+                    detail: if e.is_timeout() { "timeout" } else { "connect" }.into(),
+                }),
+            )
+        }
+    };
+    let Some(body) = body else {
+        return (
+            Vec::new(),
+            status(ProviderError::OllamaUnreachable {
+                detail: "tags".into(),
+            }),
+        );
+    };
+    let installed: Vec<serde_json::Value> = body["models"]
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "name": m["name"].as_str().or(m["model"].as_str()).unwrap_or_default(),
+                        "size_bytes": m["size"].as_u64().unwrap_or_default(),
+                        "digest": m["digest"].as_str().unwrap_or_default(),
+                        "parameter_size": m["details"]["parameter_size"]
+                            .as_str()
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_model = installed
+        .iter()
+        .any(|m| m["name"].as_str() == Some(cfg.model.as_str()));
+    let status = if has_model {
+        serde_json::json!({ "ok": true, "code": "ready", "hint": "" })
+    } else {
+        status(ProviderError::ModelNotInstalled {
+            model: cfg.model.clone(),
+        })
+    };
+    (installed, status)
+}
+
+async fn local_curator_state(brain_id: &str) -> serde_json::Value {
+    use super::adaptive::curator::provider::LocalCuratorFile;
+    let file = LocalCuratorFile::load();
+    let now = time::OffsetDateTime::now_utc();
+    let (installed_models, provider_status) = match file.provider() {
+        Ok(cfg) => probe_provider(cfg).await,
+        Err(e) => (
+            Vec::new(),
+            serde_json::json!({ "ok": false, "code": e.code(), "hint": e.user_hint() }),
+        ),
+    };
+    serde_json::json!({
+        "brain": brain_id,
+        // Both switches, as the curator itself reads them.
+        "enabled": file.enabled,
+        "transcript_access": file.transcript_access,
+        "consent_granted": curator_schedule::is_enabled(),
+        // Slice 1 fails closed off unix (no handle-relative traversal
+        // there yet), so the whole feature is macOS/Linux-only and the
+        // UI is told rather than left to guess.
+        "platform_supported": cfg!(unix),
+        "provider": file.provider,
+        "provider_configured": curator_schedule::provider_configured(),
+        "provider_status": provider_status,
+        "installed_models": installed_models,
+        "schedule": {
+            "interval_hours": curator_schedule::RUN_INTERVAL_HOURS,
+            "check_interval_secs": curator_schedule::CHECK_INTERVAL_SECS,
+            "startup_delay_secs": curator_schedule::STARTUP_DELAY_SECS,
+            "last_run": curator_schedule::read_last_run(brain_id)
+                .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
+            "decision": curator_schedule::tick_decision(brain_id, now),
+        },
+        "in_flight": curator_runner::in_flight_run(brain_id),
+    })
+}
+
+/// GET /api/local_curator — consent, provider and clock state.
+pub async fn local_curator_get(
+    Query(q): Query<AmbientLogQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = resolve_brain_id(q.brain_id.as_deref()).unwrap_or_default();
+    Ok(Json(local_curator_state(&id).await))
+}
+
+#[derive(Deserialize)]
+pub struct LocalCuratorBody {
+    /// The kill switch. Absent leaves the stored value alone.
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    transcript_access: Option<bool>,
+    /// A full `provider` block. Validated before it is written, so a
+    /// malformed endpoint fails at the PUT rather than at 2 a.m.
+    #[serde(default)]
+    provider: Option<serde_json::Value>,
+    #[serde(default, alias = "brain")]
+    brain_id: Option<String>,
+}
+
+/// PUT /api/local_curator — patch consent and/or the provider block.
+///
+/// Server-owned consent: this is the only writer, the file is the only
+/// source, and no request field ever reaches a capture or read decision
+/// except by being stored here first.
+pub async fn local_curator_set(
+    _s: State<ServerState>,
+    Json(body): Json<LocalCuratorBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use super::adaptive::curator::provider::ProviderConfig;
+
+    let mut file = local_curator_raw();
+    let obj = file.as_object_mut().ok_or_else(|| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config not an object".into(),
+        )
+    })?;
+    if let Some(enabled) = body.enabled {
+        obj.insert("enabled".into(), serde_json::Value::Bool(enabled));
+    }
+    if let Some(access) = body.transcript_access {
+        obj.insert("transcript_access".into(), serde_json::Value::Bool(access));
+    }
+    if let Some(provider) = body.provider {
+        let parsed: ProviderConfig = serde_json::from_value(provider.clone())
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("provider block: {e}")))?;
+        // Loopback-only, model named: refuse at the door.
+        parsed
+            .base_url()
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("provider block: {e}")))?;
+        obj.insert("provider".into(), provider);
+    }
+
+    let path = local_curator_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("config dir: {e}"),
+            )
+        })?;
+    }
+    let body_text = serde_json::to_string_pretty(&file)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body_text).map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("config write: {e}"),
+        )
+    })?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("config rename: {e}"),
+        )
+    })?;
+
+    let id = resolve_brain_id(body.brain_id.as_deref()).unwrap_or_default();
+    Ok(Json(local_curator_state(&id).await))
+}
+
+#[derive(Deserialize)]
+pub struct CuratorRunBody {
+    #[serde(default, alias = "brain")]
+    brain_id: Option<String>,
+}
+
+/// POST /api/curator/run — start one manual run and return immediately.
+///
+/// **202, not 200.** A batch is ~87 s per unit; holding the connection
+/// open for a half-hour run would time out in every client that matters
+/// and would make "did it start?" indistinguishable from "did it hang?".
+/// So the run is spawned, its id comes back at once, and progress is
+/// read from `GET /api/curator/runs`, which reports the in-flight row
+/// plus each unit's audit line as it lands.
+///
+/// **409 while another proposal run holds the brain.** Losing the
+/// single-flight lock is not an error, it is a queue of one that already
+/// has an occupant. The check here is advisory — the authoritative one
+/// is inside the run, under the lock — so a photo finish between two
+/// POSTs ends with the loser logging a `Busy`, never with two batches.
+pub async fn curator_run(
+    _s: State<ServerState>,
+    Json(body): Json<CuratorRunBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let id = resolve_brain_id(body.brain_id.as_deref()).map_err(ApiError::from)?;
+    if super::adaptive::lock::is_run_in_flight(&id) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            super::adaptive::lock::BrainRunBusy {
+                brain_id: id.clone(),
+            }
+            .to_string(),
+        ));
+    }
+    let run_id = curator_schedule::new_run_id();
+    let (brain, spawned) = (id.clone(), run_id.clone());
+    tokio::spawn(async move {
+        match curator_schedule::run_now_detached(&brain, &spawned).await {
+            Ok(report) => eprintln!(
+                "[curator] manual run: brain={brain} run={spawned} status={:?} proposals={}",
+                report.status, report.proposals_created
+            ),
+            Err(e) => eprintln!("[curator] manual run failed for {brain}: {e}"),
+        }
+    });
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "brain": id,
+            "run_id": run_id,
+            "status": "running",
+            "poll": "/api/curator/runs",
+        })),
+    ))
+}
+
+/// GET /api/curator/runs — the audit ledger, newest first, plus the run
+/// executing right now if there is one.
+///
+/// Deliberately its own feed rather than `consolidation_reports.jsonl`:
+/// conflating a deterministic-rule report with a model-generation
+/// receipt would make the Inspector lie about which pipeline produced
+/// what.
+///
+/// `runs` holds one line per *unit* outcome, so a long batch fills in
+/// progressively; `in_flight` is the run-level row that exists from the
+/// moment the lock is taken until the batch ends, which is what a caller
+/// polls after a 202.
+pub async fn curator_runs(
+    Query(q): Query<AmbientLogQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(q.brain_id.as_deref())?;
+        let limit = q.limit.unwrap_or(50).min(500);
+        let mut records = super::adaptive::curator::state::read_audit(&id);
+        records.reverse();
+        records.truncate(limit);
+        let in_flight = curator_runner::in_flight_run(&id);
+        Ok(serde_json::json!({
+            "brain": id,
+            "count": records.len(),
+            "running": in_flight.is_some(),
+            "in_flight": in_flight,
+            "runs": records,
+        }))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct SpanPreviewQuery {
+    proposal_id: String,
+    #[serde(default, alias = "brain")]
+    brain_id: Option<String>,
+}
+
+/// GET /api/curator/span_preview — the evidence panel's sentence text.
+///
+/// Read-only, and re-verified on every call: the transcript is re-opened
+/// through the hardened reader, the pinned prefix digest is re-checked,
+/// and the sentences are re-sliced server-side. Nothing about the
+/// transcript is stored in the proposal, so when the file has changed
+/// this returns `available: false` with a safe code instead of text
+/// nobody can vouch for.
+pub async fn curator_span_preview(
+    Query(q): Query<SpanPreviewQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
+        let id = resolve_brain_id(q.brain_id.as_deref())?;
+        let preview = curator_runner::preview_spans(&id, &q.proposal_id)?;
+        serde_json::to_value(&preview).map_err(|e| MemoryError::Other(e.to_string()))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(out))
+}
+
+// ---------------------------------------------------------------------------
+// API key management — loopback-mounted ONLY. The gateway must
+// never expose these; an external client managing its own keys
+// is a footgun (and a privilege-escalation pathway).
+//
+// The Settings UI calls these from the Tauri webview over the
+// loopback port. Three endpoints:
+//
+//   GET    /api/api_keys              list public metadata (no hashes)
+//   POST   /api/api_keys              create + return plaintext ONCE
+//   DELETE /api/api_keys/:id          revoke (sets revoked_at)
+//
+// API gateway: plaintext is shown once at
+// creation, never recoverable; revocation keeps the row for audit.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+pub struct ApiKeyListResponse {
+    pub keys: Vec<super::api_keys::ApiKeyPublic>,
+}
+
+pub async fn api_keys_list(_s: State<ServerState>) -> Result<Json<ApiKeyListResponse>, ApiError> {
+    let store = super::api_keys::current();
+    let keys = store
+        .keys
+        .iter()
+        .map(super::api_keys::ApiKeyPublic::from)
+        .collect();
+    Ok(Json(ApiKeyListResponse { keys }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ApiKeyCreateBody {
+    pub label: String,
+    /// "read" | "write" | "admin". Case-insensitive.
+    pub scope: String,
+    /// Optional. Empty = all brains permitted.
+    #[serde(default)]
+    pub brain_allowlist: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ApiKeyCreateResponse {
+    /// Plaintext key. Shown to the UI ONCE, never stored or
+    /// retrievable again. UI is responsible for the "copy this
+    /// now" modal and never logging this string.
+    pub plaintext: String,
+    pub key: super::api_keys::ApiKeyPublic,
+}
+
+pub async fn api_keys_create(
+    _s: State<ServerState>,
+    Json(body): Json<ApiKeyCreateBody>,
+) -> Result<Json<ApiKeyCreateResponse>, ApiError> {
+    let label = body.label.trim();
+    if label.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "label is required".into(),
+        ));
+    }
+    let scope = match body.scope.trim().to_lowercase().as_str() {
+        "read" => super::api_keys::Scope::Read,
+        "write" => super::api_keys::Scope::Write,
+        "admin" => super::api_keys::Scope::Admin,
+        other => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("scope must be 'read' | 'write' | 'admin', got {:?}", other),
+            ))
+        }
+    };
+    let minted =
+        super::api_keys::create_key(label, scope, body.brain_allowlist).map_err(ApiError::from)?;
+    let key = super::api_keys::ApiKeyPublic::from(&minted.record);
+    Ok(Json(ApiKeyCreateResponse {
+        plaintext: minted.plaintext,
+        key,
+    }))
+}
+
+#[derive(serde::Serialize)]
+pub struct ApiKeyRevokeResponse {
+    pub revoked: bool,
+}
+
+pub async fn api_keys_revoke(
+    Path(id): Path<String>,
+    _s: State<ServerState>,
+) -> Result<Json<ApiKeyRevokeResponse>, ApiError> {
+    let revoked = super::api_keys::revoke_key(&id).map_err(ApiError::from)?;
+    if !revoked {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("api key not found: {}", id),
+        ));
+    }
+    Ok(Json(ApiKeyRevokeResponse { revoked: true }))
+}
+
+// ---------------------------------------------------------------------------
+// Gateway config — read/write `~/.neurovault/api_gateway.json`.
+// Loopback-only (the gateway never manages its own config). The
+// Settings UI calls these to flip `enabled`, change the bind, etc.
+// Changes apply at next NeuroVault restart.
+// ---------------------------------------------------------------------------
+
+pub async fn api_gateway_config_get(
+    _s: State<ServerState>,
+) -> Result<Json<super::api_gateway::GatewayConfig>, ApiError> {
+    Ok(Json(super::api_gateway::load_config()))
+}
+
+pub async fn api_gateway_config_set(
+    _s: State<ServerState>,
+    Json(body): Json<super::api_gateway::GatewayConfig>,
+) -> Result<Json<super::api_gateway::GatewayConfig>, ApiError> {
+    // Validate the bind shape BEFORE writing to disk so a typo'd
+    // bind_ip doesn't brick the next restart.
+    if let Err(e) = body.resolve_bind() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, e));
+    }
+    super::api_gateway::save_config(&body)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(body))
+}
+
+// ---------------------------------------------------------------------------
+// Compilations: agent-driven wiki compile flow.
+//
+// Two endpoints, designed for an agent (Claude Code, Cursor) to drive
+// end-to-end without the desktop UI in the loop:
+//
+//   POST /api/compilations/prepare  body: {topic, brain?}
+//     → {topic, sources[], existing_wiki?, schema?}
+//   POST /api/compilations/submit   body: {topic, wiki_markdown,
+//                                          source_engram_ids?, brain?}
+//     → {compilation_id, wiki_engram_id, status}
+//
+// Agent flow:
+//   1. Call prepare with a topic. We run hybrid_retrieve to find the
+//      most relevant engrams, return them as "sources" plus any
+//      existing wiki page on the topic.
+//   2. Agent generates the wiki page from the pack with its own LLM.
+//   3. Call submit with the markdown. We write the wiki engram into
+//      vault/wiki/<slug>.md, INSERT a `compilations` row with status
+//      `pending` so the UI's review panel picks it up the same way an
+//      LLM-driven compile would.
+//
+// Approve / reject endpoints stay UI-only for now — agents shouldn't
+// finalise their own work.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct CompilePrepareBody {
+    topic: String,
+    #[serde(default)]
+    brain: Option<String>,
+    /// Optional override for the source pack size. Default 12 — enough
+    /// context for a wiki page, not so much we drown the agent in
+    /// duplicates.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+pub struct CompileSourceItem {
+    id: String,
+    short_id: String,
+    title: String,
+    kind: String,
+    content: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct CompileExistingWiki {
+    id: String,
+    content: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct CompilePreparePack {
+    topic: String,
+    brain_id: String,
+    sources: Vec<CompileSourceItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    existing_wiki: Option<CompileExistingWiki>,
+    schema: String,
+}
+
+pub async fn compile_prepare(
+    _s: State<ServerState>,
+    Json(body): Json<CompilePrepareBody>,
+) -> Result<Json<CompilePreparePack>, ApiError> {
+    let topic = body.topic.trim().to_string();
+    if topic.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "topic is required".into(),
+        ));
+    }
+    let result = tokio::task::spawn_blocking(move || -> Result<CompilePreparePack, MemoryError> {
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        let db = super::db::open_brain(&id)?;
+        // Find sources via hybrid retrieve. Same pipeline the recall
+        // tool uses, just at a slightly larger top_k so the agent has
+        // headroom to pick what is relevant.
+        let opts = super::retriever::RecallOpts {
+            top_k: body.limit.unwrap_or(12),
+            spread_hops: 1,
+            exclude_kinds: vec!["observation".to_string()],
+            as_of: None,
+            use_reranker: false,
+            ablate: Vec::new(),
+        };
+        let hits = super::retriever::hybrid_retrieve(&db, &topic, &opts)?;
+        let sources: Vec<CompileSourceItem> = {
+            let conn = db.lock();
+            let mut out = Vec::with_capacity(hits.len());
+            for h in &hits {
+                let kind: String = conn
+                    .query_row(
+                        "SELECT COALESCE(kind, 'note') FROM engrams WHERE id = ?1",
+                        [&h.engram_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_else(|_| "note".to_string());
+                let short_id: String = h.engram_id.chars().take(8).collect();
+                out.push(CompileSourceItem {
+                    id: h.engram_id.clone(),
+                    short_id,
+                    title: h.title.clone(),
+                    kind,
+                    content: h.content.clone(),
+                });
+            }
+            out
+        };
+        // Existing wiki engram for this topic, if any. Match by slug
+        // of the topic in the filename — same naming convention the
+        // submit handler will use to write a new one.
+        let slug = slug::slugify(&topic);
+        let wiki_filename = format!("wiki/{}.md", slug);
+        let existing_wiki: Option<CompileExistingWiki> = {
+            let conn = db.lock();
+            conn.query_row(
+                "SELECT id, COALESCE(content, '') FROM engrams \
+                 WHERE filename = ?1 AND state != 'dormant'",
+                [&wiki_filename],
+                |r| {
+                    Ok(CompileExistingWiki {
+                        id: r.get::<_, String>(0)?,
+                        content: r.get::<_, String>(1)?,
+                    })
+                },
+            )
+            .ok()
+        };
+        // Optional CLAUDE.md / brain schema. Best-effort; missing file
+        // is fine, just return empty.
+        let vault = super::read_ops::resolve_vault_path(&id)?;
+        let schema = std::fs::read_to_string(vault.join("CLAUDE.md"))
+            .or_else(|_| std::fs::read_to_string(vault.join("schema.md")))
+            .unwrap_or_default();
+        Ok(CompilePreparePack {
+            topic,
+            brain_id: id,
+            sources,
+            existing_wiki,
+            schema,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(serde::Deserialize)]
+pub struct CompileSubmitBody {
+    topic: String,
+    wiki_markdown: String,
+    #[serde(default)]
+    source_engram_ids: Vec<String>,
+    #[serde(default)]
+    brain: Option<String>,
+    /// When true, the new row is created with status='approved' and a
+    /// review_comment of 'auto-approved'. Used by the UI's
+    /// auto-approve toggle and by trusted MCP flows where a human is
+    /// not in the loop.
+    #[serde(default)]
+    auto_approve: Option<bool>,
+}
+
+#[derive(serde::Serialize)]
+pub struct CompileSubmitResult {
+    compilation_id: String,
+    wiki_engram_id: String,
+    wiki_filename: String,
+    brain_id: String,
+    status: String,
+}
+
+pub async fn compile_submit(
+    _s: State<ServerState>,
+    Json(body): Json<CompileSubmitBody>,
+) -> Result<Json<CompileSubmitResult>, ApiError> {
+    if body.topic.trim().is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "topic is required".into(),
+        ));
+    }
+    if body.wiki_markdown.trim().is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "wiki_markdown is required".into(),
+        ));
+    }
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<CompileSubmitResult, MemoryError> {
+            let id = resolve_brain_id(body.brain.as_deref())?;
+            let vault = super::read_ops::resolve_vault_path(&id)?;
+            let ctx = super::write_ops::BrainContext::resolve(Some(&id), vault)?;
+            let slug = slug::slugify(&body.topic);
+            let wiki_filename = format!("wiki/{}.md", slug);
+            // Look up the existing wiki engram (if any) to capture old
+            // content for the compilations row.
+            let old_content: Option<String> = {
+                let conn = ctx.db.lock();
+                conn.query_row(
+                    "SELECT COALESCE(content, '') FROM engrams WHERE filename = ?1",
+                    [&wiki_filename],
+                    |r| r.get(0),
+                )
+                .ok()
+            };
+            // Write through the standard save_note path so the file lands
+            // on disk + the engram is re-ingested with correct chunks /
+            // embeddings / kind.
+            let write = super::write_ops::save_note(&ctx, &wiki_filename, &body.wiki_markdown)?;
+            // Mark the engram kind as wiki so it shows up correctly in
+            // the graph + retrieval.
+            {
+                let conn = ctx.db.lock();
+                conn.execute(
+                    "UPDATE engrams SET kind = 'wiki' WHERE id = ?1",
+                    [&write.engram_id],
+                )?;
+            }
+            // Persist a compilations row. Status depends on the
+            // auto_approve flag: pending (the default — user reviews in
+            // the Compile tab) or approved (auto-approved on submit).
+            let compilation_id = uuid::Uuid::new_v4().to_string();
+            let sources_json =
+                serde_json::to_string(&body.source_engram_ids).map_err(MemoryError::Json)?;
+            let auto = body.auto_approve.unwrap_or(false);
+            let initial_status = if auto { "approved" } else { "pending" };
+            {
+                let conn = ctx.db.lock();
+                if auto {
+                    conn.execute(
+                        "INSERT INTO compilations \
+                     (id, topic, wiki_engram_id, old_content, new_content, \
+                      changelog_json, sources_json, model, input_tokens, \
+                      output_tokens, status, created_at, reviewed_at, \
+                      review_comment) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, '[]', ?6, 'agent-driven', \
+                      0, 0, 'approved', \
+                      strftime('%Y-%m-%d %H:%M:%f', 'now'), \
+                      strftime('%Y-%m-%d %H:%M:%f', 'now'), \
+                      'auto-approved')",
+                        rusqlite::params![
+                            compilation_id,
+                            body.topic,
+                            write.engram_id,
+                            old_content,
+                            body.wiki_markdown,
+                            sources_json,
+                        ],
+                    )?;
+                } else {
+                    conn.execute(
+                        "INSERT INTO compilations \
+                     (id, topic, wiki_engram_id, old_content, new_content, \
+                      changelog_json, sources_json, model, input_tokens, \
+                      output_tokens, status, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, '[]', ?6, 'agent-driven', \
+                      0, 0, 'pending', strftime('%Y-%m-%d %H:%M:%f', 'now'))",
+                        rusqlite::params![
+                            compilation_id,
+                            body.topic,
+                            write.engram_id,
+                            old_content,
+                            body.wiki_markdown,
+                            sources_json,
+                        ],
+                    )?;
+                }
+            }
+            Ok(CompileSubmitResult {
+                compilation_id,
+                wiki_engram_id: write.engram_id,
+                wiki_filename,
+                brain_id: id,
+                status: initial_status.to_string(),
+            })
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Compilations review queue — endpoints the desktop UI's Compile tab
+// loads on open. Without these the tab errors with 404 the moment it
+// mounts. Mirrors the shape `src/lib/api.ts` expects for
+// CompilationSummary / CompilationDetail.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+pub struct CompilationSummary {
+    id: String,
+    topic: String,
+    status: String,
+    model: String,
+    change_count: i64,
+    source_count: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    created_at: String,
+    reviewed_at: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct CompilationDetail {
+    id: String,
+    topic: String,
+    status: String,
+    model: String,
+    change_count: i64,
+    source_count: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    created_at: String,
+    reviewed_at: Option<String>,
+    wiki_engram_id: Option<String>,
+    old_content: String,
+    new_content: String,
+    changelog: serde_json::Value,
+    sources: serde_json::Value,
+    review_comment: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct CompilationsListQuery {
+    status: Option<String>,
+    limit: Option<i64>,
+}
+
+fn read_summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CompilationSummary> {
+    let changelog_json: String = r
+        .get::<_, Option<String>>(8)?
+        .unwrap_or_else(|| "[]".into());
+    let sources_json: String = r
+        .get::<_, Option<String>>(9)?
+        .unwrap_or_else(|| "[]".into());
+    let change_count = serde_json::from_str::<serde_json::Value>(&changelog_json)
+        .ok()
+        .and_then(|v| v.as_array().map(|a| a.len() as i64))
+        .unwrap_or(0);
+    let source_count = serde_json::from_str::<serde_json::Value>(&sources_json)
+        .ok()
+        .and_then(|v| v.as_array().map(|a| a.len() as i64))
+        .unwrap_or(0);
+    Ok(CompilationSummary {
+        id: r.get(0)?,
+        topic: r.get(1)?,
+        status: r.get(2)?,
+        model: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        input_tokens: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+        output_tokens: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+        created_at: r.get(6)?,
+        reviewed_at: r.get(7)?,
+        change_count,
+        source_count,
+    })
+}
+
+pub async fn compilations_list(
+    Query(q): Query<CompilationsListQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<Vec<CompilationSummary>>, ApiError> {
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<Vec<CompilationSummary>, MemoryError> {
+            let id = resolve_brain_id(None)?;
+            let db = open_brain(&id)?;
+            let conn = db.lock();
+            let limit = q.limit.unwrap_or(50).clamp(1, 500);
+            let rows: Vec<CompilationSummary> = if let Some(st) = q.status.as_deref() {
+                let mut stmt = conn.prepare(
+                    "SELECT id, topic, status, model, input_tokens, output_tokens, \
+                 created_at, reviewed_at, changelog_json, sources_json \
+                 FROM compilations WHERE status = ?1 \
+                 ORDER BY created_at DESC LIMIT ?2",
+                )?;
+                let mapped = stmt.query_map(rusqlite::params![st, limit], read_summary_row)?;
+                mapped.filter_map(std::result::Result::ok).collect()
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT id, topic, status, model, input_tokens, output_tokens, \
+                 created_at, reviewed_at, changelog_json, sources_json \
+                 FROM compilations \
+                 ORDER BY created_at DESC LIMIT ?1",
+                )?;
+                let mapped = stmt.query_map(rusqlite::params![limit], read_summary_row)?;
+                mapped.filter_map(std::result::Result::ok).collect()
+            };
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+pub async fn compilations_pending(
+    s: State<ServerState>,
+) -> Result<Json<Vec<CompilationSummary>>, ApiError> {
+    compilations_list(
+        Query(CompilationsListQuery {
+            status: Some("pending".to_string()),
+            limit: Some(50),
+        }),
+        s,
+    )
+    .await
+}
+
+pub async fn compilations_get(
+    _s: State<ServerState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<CompilationDetail>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<CompilationDetail, MemoryError> {
+        let bid = resolve_brain_id(None)?;
+        let db = open_brain(&bid)?;
+        let conn = db.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, topic, status, model, input_tokens, output_tokens, \
+             created_at, reviewed_at, changelog_json, sources_json, \
+             wiki_engram_id, old_content, new_content, review_comment \
+             FROM compilations WHERE id = ?1",
+        )?;
+        stmt.query_row([&id], |r| {
+            let changelog_json: String = r
+                .get::<_, Option<String>>(8)?
+                .unwrap_or_else(|| "[]".into());
+            let sources_json: String = r
+                .get::<_, Option<String>>(9)?
+                .unwrap_or_else(|| "[]".into());
+            let changelog =
+                serde_json::from_str(&changelog_json).unwrap_or(serde_json::Value::Array(vec![]));
+            let sources =
+                serde_json::from_str(&sources_json).unwrap_or(serde_json::Value::Array(vec![]));
+            let change_count = changelog.as_array().map(|a| a.len() as i64).unwrap_or(0);
+            let source_count = sources.as_array().map(|a| a.len() as i64).unwrap_or(0);
+            Ok(CompilationDetail {
+                id: r.get(0)?,
+                topic: r.get(1)?,
+                status: r.get(2)?,
+                model: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                input_tokens: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                output_tokens: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                created_at: r.get(6)?,
+                reviewed_at: r.get(7)?,
+                wiki_engram_id: r.get(10)?,
+                old_content: r.get::<_, Option<String>>(11)?.unwrap_or_default(),
+                new_content: r.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                review_comment: r.get(13)?,
+                changelog,
+                sources,
+                change_count,
+                source_count,
+            })
+        })
+        .map_err(MemoryError::from)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e: MemoryError| match &e {
+        MemoryError::Database(rusqlite::Error::QueryReturnedNoRows) => {
+            ApiError(StatusCode::NOT_FOUND, "compilation not found".into())
+        }
+        _ => ApiError::from(e),
+    })?;
+    Ok(Json(result))
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct ReviewBody {
+    #[serde(default)]
+    review_comment: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ReviewResult {
+    status: String,
+    id: String,
+}
+
+pub async fn compilations_approve(
+    _s: State<ServerState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Option<Json<ReviewBody>>,
+) -> Result<Json<ReviewResult>, ApiError> {
+    let body = body.map(|j| j.0).unwrap_or_default();
+    let result = tokio::task::spawn_blocking(move || -> Result<ReviewResult, MemoryError> {
+        let bid = resolve_brain_id(None)?;
+        let db = open_brain(&bid)?;
+        let conn = db.lock();
+        let n = conn.execute(
+            "UPDATE compilations SET status = 'approved', \
+             reviewed_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), \
+             review_comment = ?1 WHERE id = ?2",
+            rusqlite::params![body.review_comment, id],
+        )?;
+        if n == 0 {
+            return Err(MemoryError::Other(format!("compilation not found: {}", id)));
+        }
+        Ok(ReviewResult {
+            status: "approved".to_string(),
+            id,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+pub async fn compilations_reject(
+    _s: State<ServerState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Option<Json<ReviewBody>>,
+) -> Result<Json<ReviewResult>, ApiError> {
+    let body = body.map(|j| j.0).unwrap_or_default();
+    let result = tokio::task::spawn_blocking(move || -> Result<ReviewResult, MemoryError> {
+        let bid = resolve_brain_id(None)?;
+        let db = open_brain(&bid)?;
+        let conn = db.lock();
+        // Revert: read old_content, write it back to the wiki engram, then
+        // mark rejected. If old_content is empty (this was a brand-new
+        // wiki page), we leave the wiki engram in place — the user can
+        // delete it manually if they want.
+        let row: Option<(Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT wiki_engram_id, old_content FROM compilations WHERE id = ?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        if let Some((Some(eid), Some(old))) = row {
+            if !old.is_empty() {
+                let _ = conn.execute(
+                    "UPDATE engrams SET content = ?1, \
+                     updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') WHERE id = ?2",
+                    rusqlite::params![old, eid],
+                );
+            }
+        }
+        let n = conn.execute(
+            "UPDATE compilations SET status = 'rejected', \
+             reviewed_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), \
+             review_comment = ?1 WHERE id = ?2",
+            rusqlite::params![body.review_comment, id],
+        )?;
+        if n == 0 {
+            return Err(MemoryError::Other(format!("compilation not found: {}", id)));
+        }
+        Ok(ReviewResult {
+            status: "rejected".to_string(),
+            id,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Cluster naming endpoints — backs the `/name-clusters` skill.
+//
+// GET /api/clusters returns the latest Louvain partition's clusters
+// with sample titles + wikilinks. POST /api/clusters/names merges
+// incoming names into ~/.neurovault/brains/{id}/cluster_names.json.
+// State is populated by the frontend via nv_set_clusters whenever
+// Analytics mode runs Louvain (i.e. on graph data change).
+//
+// Why HTTP instead of just a Tauri command: agents (Claude Code,
+// Cursor) reach the brain via the MCP proxy, which forwards to this
+// HTTP server. So agent-driven cluster naming MUST go through HTTP.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct ClustersQuery {
+    brain_id: Option<String>,
+    /// When true, only return clusters that don't already have a name
+    /// in cluster_names.json. Default true so the agent can run
+    /// `/name-clusters` repeatedly without re-naming what was named
+    /// already.
+    only_unnamed: Option<bool>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ClusterListItem {
+    id: u32,
+    size: usize,
+    top_titles: Vec<String>,
+    sample_links: Vec<String>,
+    /// Already-saved name, if any. Agent uses this to skip clusters
+    /// the user has hand-edited.
+    name: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ClusterListResponse {
+    clusters: Vec<ClusterListItem>,
+    /// True when no Analytics-mode push has happened yet this session.
+    /// Agents see this and tell the user "open the app and enable
+    /// Analytics mode first."
+    needs_analytics: bool,
+}
+
+pub async fn clusters_list(
+    Query(q): Query<ClustersQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<ClusterListResponse>, ApiError> {
+    let only_unnamed = q.only_unnamed.unwrap_or(true);
+    let brain_id = q.brain_id.clone();
+
+    let resp = tokio::task::spawn_blocking(move || -> Result<ClusterListResponse, MemoryError> {
+        let id = resolve_brain_id(brain_id.as_deref())?;
+        let summaries = super::cluster_state::get_summaries(&id);
+        let names = super::cluster_state::read_names(&id);
+        let needs_analytics = summaries.is_empty();
+        let clusters = summaries
+            .into_iter()
+            .filter_map(|c| {
+                let existing = names.get(&c.id).cloned();
+                if only_unnamed && existing.is_some() {
+                    return None;
+                }
+                Some(ClusterListItem {
+                    id: c.id,
+                    size: c.size,
+                    top_titles: c.top_titles,
+                    sample_links: c.sample_links,
+                    name: existing,
+                })
+            })
+            .collect();
+        Ok(ClusterListResponse {
+            clusters,
+            needs_analytics,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+
+    Ok(Json(resp))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetClusterNamesBody {
+    /// Map from cluster id (string for JSON ergonomics) to user/agent
+    /// label. Empty string clears that cluster's name.
+    names: std::collections::HashMap<String, String>,
+    brain_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct SetClusterNamesResponse {
+    saved: usize,
+    total_named: usize,
+}
+
+pub async fn clusters_set_names(
+    _s: State<ServerState>,
+    Json(body): Json<SetClusterNamesBody>,
+) -> Result<Json<SetClusterNamesResponse>, ApiError> {
+    let brain_id = body.brain_id.clone();
+    let incoming_str = body.names;
+
+    let resp =
+        tokio::task::spawn_blocking(move || -> Result<SetClusterNamesResponse, MemoryError> {
+            let id = resolve_brain_id(brain_id.as_deref())?;
+            let mut parsed: std::collections::HashMap<u32, String> =
+                std::collections::HashMap::new();
+            let saved = incoming_str.len();
+            for (k, v) in incoming_str {
+                if let Ok(cid) = k.parse::<u32>() {
+                    parsed.insert(cid, v);
+                }
+            }
+            let merged =
+                super::cluster_state::merge_names(&id, parsed).map_err(MemoryError::Other)?;
+            Ok(SetClusterNamesResponse {
+                saved,
+                total_named: merged.len(),
+            })
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+
+    Ok(Json(resp))
+}
+
+// ===========================================================================
+// Endpoints ported from the Python sidecar in v0.1.1.1.
+// ===========================================================================
+//
+// The Python `api.py` had these routes; the Rust HTTP server initially
+// shipped without them, so MCP tools that the proxy still advertised
+// (session_start, recall_chunks, check_duplicate, core_memory_*, todos,
+// changes, POST /api/brains) returned 404. This block restores them.
+// ===========================================================================
+
+// --- POST /api/brains  (create_brain bug fix) ----------------------------
+
+#[derive(Deserialize)]
+pub struct CreateBrainBody {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    vault_path: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct CreateBrainResponse {
+    id: String,
+    name: String,
+}
+
+pub async fn brains_create(
+    _s: State<ServerState>,
+    Json(body): Json<CreateBrainBody>,
+) -> Result<Json<CreateBrainResponse>, ApiError> {
+    use std::fs;
+
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "name required".into()));
+    }
+
+    let resp = tokio::task::spawn_blocking(move || -> Result<CreateBrainResponse, MemoryError> {
+        let mut id = String::new();
+        for ch in name.chars() {
+            if ch.is_ascii_alphanumeric() {
+                id.push(ch.to_ascii_lowercase());
+            } else if ch == ' ' || ch == '-' || ch == '_' {
+                id.push('-');
+            }
+        }
+        if id.is_empty() {
+            return Err(MemoryError::Other("name had no usable chars".into()));
+        }
+
+        let registry_path = super::paths::registry_path();
+        let raw = fs::read_to_string(&registry_path).unwrap_or_else(|_| "{\"brains\":[]}".into());
+        let mut json: serde_json::Value = serde_json::from_str(&raw).map_err(MemoryError::Json)?;
+
+        let brains_arr = json
+            .get_mut("brains")
+            .and_then(|v| v.as_array_mut())
+            .ok_or_else(|| MemoryError::Other("brains.json malformed".into()))?;
+
+        let mut final_id = id.clone();
+        let mut n = 2;
+        while brains_arr
+            .iter()
+            .any(|b| b.get("id").and_then(|v| v.as_str()) == Some(&final_id))
+        {
+            final_id = format!("{}-{}", id, n);
+            n += 1;
+        }
+
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        let mut entry = serde_json::json!({
+            "id": final_id,
+            "name": name,
+            "description": body.description,
+            "created_at": now,
+        });
+        if let Some(vp) = body.vault_path {
+            if !vp.is_empty() {
+                entry["vault_path"] = serde_json::Value::String(vp);
+            }
+        }
+        brains_arr.push(entry);
+
+        // Create ~/.neurovault before writing brains.json into it.
+        //
+        // The desktop app gets away without this by accident: its startup
+        // does create_dir_all on the default vault, which builds the whole
+        // chain. The headless server (`neurovault-server --http-only`, the
+        // npm and Docker path) never does — so on a machine that had never
+        // run NeuroVault, the very first "create a brain" call died right
+        // here with an unhelpful `i/o error: No such file or directory`
+        // and HTTP 500. Reproduced against a fresh NEUROVAULT_HOME.
+        if let Some(parent) = registry_path.parent() {
+            fs::create_dir_all(parent).map_err(MemoryError::Io)?;
+        }
+
+        let tmp = registry_path.with_extension("json.tmp");
+        fs::write(
+            &tmp,
+            serde_json::to_string_pretty(&json).map_err(MemoryError::Json)?,
+        )
+        .map_err(MemoryError::Io)?;
+        std::fs::rename(&tmp, &registry_path).map_err(MemoryError::Io)?;
+
+        let _db = open_brain(&final_id)?;
+        Ok(CreateBrainResponse { id: final_id, name })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+
+    Ok(Json(resp))
+}
+
+// --- POST /api/check_duplicate -------------------------------------------
+
+#[derive(Deserialize)]
+pub struct CheckDuplicateBody {
+    content: String,
+    #[serde(default = "default_dupe_threshold")]
+    threshold: f64,
+    brain: Option<String>,
+}
+
+fn default_dupe_threshold() -> f64 {
+    0.85
+}
+
+#[derive(Serialize)]
+pub struct CheckDuplicateResponse {
+    found: bool,
+    engram_id: Option<String>,
+    similarity: Option<f64>,
+    title: Option<String>,
+}
+
+pub async fn check_duplicate(
+    _s: State<ServerState>,
+    Json(body): Json<CheckDuplicateBody>,
+) -> Result<Json<CheckDuplicateResponse>, ApiError> {
+    let resp =
+        tokio::task::spawn_blocking(move || -> Result<CheckDuplicateResponse, MemoryError> {
+            let id = resolve_brain_id(body.brain.as_deref())?;
+            let db = open_brain(&id)?;
+            let trimmed = body.content.trim();
+            if trimmed.is_empty() {
+                return Ok(CheckDuplicateResponse {
+                    found: false,
+                    engram_id: None,
+                    similarity: None,
+                    title: None,
+                });
+            }
+            let vec = super::embedder::encode(trimmed)?;
+            let conn = db.lock();
+            // vec0 KNN pattern: MATCH operator + k = ?. Returns
+            // chunk_id + distance from the virtual table, then we
+            // join chunks + engrams to get the human-readable bits.
+            let mut stmt = conn.prepare(
+                "SELECT c.engram_id, e.title, v.distance \
+                 FROM vec_chunks v \
+                 JOIN chunks c ON c.id = v.chunk_id \
+                 JOIN engrams e ON e.id = c.engram_id \
+                 WHERE v.embedding MATCH ?1 AND k = 5 \
+                 ORDER BY v.distance ASC",
+            )?;
+            let bytes = embedder_bytes(&vec);
+            let hit = stmt
+                .query_row(rusqlite::params![bytes], |r| {
+                    let eid: String = r.get(0)?;
+                    let title: String = r.get(1)?;
+                    let dist: f64 = r.get(2)?;
+                    Ok((eid, title, dist))
+                })
+                .ok();
+            match hit {
+                Some((eid, title, dist)) => {
+                    let sim = 1.0 - dist;
+                    if sim >= body.threshold {
+                        Ok(CheckDuplicateResponse {
+                            found: true,
+                            engram_id: Some(eid),
+                            similarity: Some(sim),
+                            title: Some(title),
+                        })
+                    } else {
+                        Ok(CheckDuplicateResponse {
+                            found: false,
+                            engram_id: None,
+                            similarity: Some(sim),
+                            title: None,
+                        })
+                    }
+                }
+                None => Ok(CheckDuplicateResponse {
+                    found: false,
+                    engram_id: None,
+                    similarity: None,
+                    title: None,
+                }),
+            }
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+
+    Ok(Json(resp))
+}
+
+fn embedder_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out
+}
+
+// --- GET /api/recall/chunks ----------------------------------------------
+
+#[derive(Deserialize)]
+pub struct RecallChunksQuery {
+    q: String,
+    #[serde(default = "default_chunks_limit")]
+    limit: usize,
+    brain: Option<String>,
+}
+
+fn default_chunks_limit() -> usize {
+    10
+}
+
+#[derive(Serialize)]
+pub struct ChunkHit {
+    engram_id: String,
+    title: String,
+    chunk_text: String,
+    granularity: String,
+    similarity: f64,
+}
+
+#[derive(Serialize)]
+pub struct RecallChunksResponse {
+    hits: Vec<ChunkHit>,
+}
+
+/// Second stage of chunk recall, split out from the vec0 KNN so it can
+/// be exercised against a plain in-memory connection (the vec0
+/// extension is not loadable from a unit test).
+///
+/// `ranked` is the KNN result — `(chunk_id, distance)` in ascending
+/// distance order. This resolves those ids to rows, applies the SAME
+/// visibility rules every other retrieval channel applies
+/// (`state != 'dormant'` AND `superseded_by IS NULL`) plus any
+/// `kind:`/`folder:`/`after:`/`entity:` operators the caller parsed out
+/// of the query, then dedupes to the best chunk per engram while
+/// preserving KNN order.
+pub(crate) fn chunk_rows_for_candidates(
+    conn: &rusqlite::Connection,
+    ranked: &[(String, f64)],
+    filters: &super::query_parser::QueryFilters,
+    limit: usize,
+) -> Result<Vec<ChunkHit>, MemoryError> {
+    if ranked.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    // Bare `?` placeholders throughout: `filter_sql` emits unnumbered
+    // ones, and SQLite refuses a mix of numbered and unnumbered.
+    let placeholders = std::iter::repeat_n("?", ranked.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let (filter_frag, filter_params) = super::query_parser::filter_sql(filters);
+    let sql = format!(
+        "SELECT c.id, c.engram_id, e.title, c.content, c.granularity \
+         FROM chunks c \
+         JOIN engrams e ON e.id = c.engram_id \
+         WHERE c.id IN ({}) \
+               AND e.state != 'dormant' \
+               AND e.superseded_by IS NULL{}",
+        placeholders, filter_frag
+    );
+    let mut params: Vec<rusqlite::types::Value> = ranked
+        .iter()
+        .map(|(id, _)| rusqlite::types::Value::Text(id.clone()))
+        .collect();
+    params.extend(filter_params);
+
+    let mut stmt = conn.prepare(&sql)?;
+    // chunk_id -> (engram_id, title, content, granularity)
+    let mut by_chunk: std::collections::HashMap<String, (String, String, String, String)> =
+        std::collections::HashMap::new();
+    let mapped = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    for row in mapped {
+        let (cid, eid, title, text, gran) = row?;
+        by_chunk.insert(cid, (eid, title, text, gran));
+    }
+
+    // Walk the KNN order, keeping only the best-ranked surviving chunk
+    // per engram so one long note can't flood the result.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut rows: Vec<ChunkHit> = Vec::with_capacity(limit);
+    for (chunk_id, dist) in ranked {
+        let Some((eid, title, text, gran)) = by_chunk.get(chunk_id) else {
+            continue;
+        };
+        if !seen.insert(eid.clone()) {
+            continue;
+        }
+        rows.push(ChunkHit {
+            engram_id: eid.clone(),
+            title: title.clone(),
+            chunk_text: text.clone(),
+            granularity: gran.clone(),
+            similarity: 1.0 - dist,
+        });
+        if rows.len() >= limit {
+            break;
+        }
+    }
+    Ok(rows)
+}
+
+pub async fn recall_chunks(
+    Query(q): Query<RecallChunksQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<RecallChunksResponse>, ApiError> {
+    let resp = tokio::task::spawn_blocking(move || -> Result<RecallChunksResponse, MemoryError> {
+        let id = resolve_brain_id(q.brain.as_deref())?;
+        let db = open_brain(&id)?;
+        // Honour the same query operators plain `recall` honours: pull
+        // `kind:`/`folder:`/`after:`/`entity:`… out before embedding, so
+        // the vector search sees only the free text and the operators
+        // gate rows in SQL. An operators-only query keeps the raw string
+        // as the embedding input (mirrors `hybrid_retrieve_inner`).
+        let (filters, free_text) = super::query_parser::parse(&q.q);
+        let effective_query = if free_text.is_empty() {
+            q.q.clone()
+        } else {
+            free_text
+        };
+        let qvec = super::embedder::encode(&effective_query)?;
+        let conn = db.lock();
+        // Over-fetch so the post-KNN visibility/operator pass still has
+        // enough survivors to fill `limit` after dedup-by-engram. vec0's
+        // MATCH operator doesn't compose with joins or window functions
+        // cleanly, so KNN first, filter second. Filters cut harder than
+        // dedup alone, so they buy a bigger over-fetch.
+        let bytes = embedder_bytes(&qvec);
+        let limit = q.limit.min(50);
+        let overfetch = if filters.is_empty() {
+            (limit * 5).max(20)
+        } else {
+            (limit * 20).max(100)
+        }
+        .min(1000) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT chunk_id, distance FROM vec_chunks \
+             WHERE embedding MATCH ?1 AND k = ?2 \
+             ORDER BY distance ASC",
+        )?;
+        let ranked = stmt
+            .query_map(rusqlite::params![bytes, overfetch], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let rows = chunk_rows_for_candidates(&conn, &ranked, &filters, limit)?;
+        Ok(RecallChunksResponse { hits: rows })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+
+    Ok(Json(resp))
+}
+
+#[cfg(test)]
+mod recall_chunks_tests {
+    use super::chunk_rows_for_candidates;
+    use crate::memory::query_parser::{self, QueryFilters};
+    use rusqlite::Connection;
+
+    /// Just the columns the second stage reads. vec0 is deliberately
+    /// absent: the KNN stage is handed in as `ranked`, so the parts we
+    /// can regress on (visibility + operators + dedup) test without the
+    /// extension.
+    fn fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE engrams (
+                 id TEXT PRIMARY KEY, title TEXT, kind TEXT, state TEXT,
+                 filename TEXT, agent_id TEXT, created_at TEXT, superseded_by TEXT);
+             CREATE TABLE chunks (
+                 id TEXT PRIMARY KEY, engram_id TEXT NOT NULL, content TEXT,
+                 granularity TEXT);
+             CREATE TABLE entities (id TEXT PRIMARY KEY, name TEXT);
+             CREATE TABLE entity_mentions (entity_id TEXT, engram_id TEXT);
+
+             INSERT INTO engrams VALUES
+                 ('e-live','Current deploy target','note','active',
+                  'work/deploy.md','claude-code','2026-05-01',NULL);
+             INSERT INTO engrams VALUES
+                 ('e-stale','Old deploy target','note','active',
+                  'work/deploy-old.md','claude-code','2026-01-01','e-live');
+             INSERT INTO engrams VALUES
+                 ('e-insight','Why we moved','insight','active',
+                  'notes/why.md','cursor','2026-06-01',NULL);
+             INSERT INTO engrams VALUES
+                 ('e-dormant','Deleted note','note','dormant',
+                  'work/gone.md','claude-code','2026-02-01',NULL);
+
+             INSERT INTO chunks VALUES ('c-stale','e-stale','staging is the target','paragraph');
+             INSERT INTO chunks VALUES ('c-live','e-live','production is the target','paragraph');
+             INSERT INTO chunks VALUES ('c-insight','e-insight','we moved for latency','paragraph');
+             INSERT INTO chunks VALUES ('c-dormant','e-dormant','gone','paragraph');
+             INSERT INTO chunks VALUES ('c-live-2','e-live','second passage','paragraph');",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// KNN order with the superseded note ranked FIRST — the shape that
+    /// made recall_chunks serve a retired claim as the top passage.
+    fn ranked() -> Vec<(String, f64)> {
+        vec![
+            ("c-stale".to_string(), 0.10),
+            ("c-dormant".to_string(), 0.15),
+            ("c-live".to_string(), 0.20),
+            ("c-live-2".to_string(), 0.25),
+            ("c-insight".to_string(), 0.30),
+        ]
+    }
+
+    #[test]
+    fn superseded_engram_chunks_are_excluded() {
+        let conn = fixture();
+        let rows =
+            chunk_rows_for_candidates(&conn, &ranked(), &QueryFilters::default(), 10).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.engram_id.as_str()).collect();
+        assert!(
+            !ids.contains(&"e-stale"),
+            "a superseded engram's chunk must never be served: got {ids:?}"
+        );
+        // Dormant stays excluded too (pre-existing behaviour), and the
+        // survivors keep KNN order, deduped to one chunk per engram.
+        assert_eq!(ids, vec!["e-live", "e-insight"]);
+    }
+
+    /// A `confidence` outside [0,1] is a caller bug (60 meaning "60%"),
+    /// and clamping it to 1.0 would turn that bug into a note that
+    /// claims certainty. Reject instead.
+    #[test]
+    fn out_of_range_confidence_is_rejected_not_clamped() {
+        use super::validate_confidence;
+        assert!(validate_confidence(None).is_ok());
+        assert!(validate_confidence(Some(0.0)).is_ok());
+        assert!(validate_confidence(Some(0.6)).is_ok());
+        assert!(validate_confidence(Some(1.0)).is_ok());
+        for bad in [60.0, 1.0001, -0.1, f64::NAN, f64::INFINITY] {
+            let err = validate_confidence(Some(bad)).err();
+            assert!(err.is_some(), "confidence {bad} should be rejected");
+            assert_eq!(err.unwrap().0, super::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn kind_operator_filters_chunks() {
+        let conn = fixture();
+        let (filters, free) = query_parser::parse("kind:insight why we moved");
+        assert_eq!(free, "why we moved", "operators must leave the free text");
+        let rows = chunk_rows_for_candidates(&conn, &ranked(), &filters, 10).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.engram_id.as_str()).collect();
+        assert_eq!(ids, vec!["e-insight"]);
+    }
+
+    #[test]
+    fn folder_and_after_operators_filter_chunks() {
+        let conn = fixture();
+        let (filters, _) = query_parser::parse("folder:notes deploy");
+        let rows = chunk_rows_for_candidates(&conn, &ranked(), &filters, 10).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.engram_id.as_str()).collect();
+        assert_eq!(ids, vec!["e-insight"], "folder: must scope to notes/");
+
+        let (filters, _) = query_parser::parse("after:2026-05-15 deploy");
+        let rows = chunk_rows_for_candidates(&conn, &ranked(), &filters, 10).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.engram_id.as_str()).collect();
+        assert_eq!(ids, vec!["e-insight"], "after: must drop older engrams");
+    }
+
+    #[test]
+    fn limit_caps_results_and_similarity_inverts_distance() {
+        let conn = fixture();
+        let rows =
+            chunk_rows_for_candidates(&conn, &ranked(), &QueryFilters::default(), 1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].engram_id, "e-live");
+        assert!((rows[0].similarity - 0.80).abs() < 1e-9);
+        assert_eq!(rows[0].chunk_text, "production is the target");
+    }
+}
+
+// --- GET /api/session_start ----------------------------------------------
+
+#[derive(Deserialize)]
+pub struct SessionStartQuery {
+    brain: Option<String>,
+    /// Optional: scope the bootstrap to one agent — return THAT agent's own
+    /// recent engrams + its inbox instead of the brain-wide view. Absent =>
+    /// unchanged (back-compat).
+    agent: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct TopMemorySummary {
+    engram_id: String,
+    title: String,
+    strength: f64,
+    state: String,
+    access_count: i64,
+}
+
+#[derive(Serialize)]
+pub struct SessionStartResponse {
+    brain: Option<BrainSummary>,
+    stats: Option<BrainStats>,
+    core_memory: Vec<CoreBlock>,
+    top_memories: Vec<TopMemorySummary>,
+    open_todos: Vec<Todo>,
+}
+
+pub async fn session_start(
+    Query(q): Query<SessionStartQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<SessionStartResponse>, ApiError> {
+    let resp = tokio::task::spawn_blocking(move || -> Result<SessionStartResponse, MemoryError> {
+        let id = resolve_brain_id(q.brain.as_deref())?;
+        let stats = brain_stats(&id).ok();
+        let brain = list_brains_with_stats()
+            .ok()
+            .and_then(|all| all.into_iter().find(|b| b.id == id));
+        let core_memory = core_memory::list_blocks(&id).unwrap_or_default();
+        // Agent-scoped (optional): `agent` set => that agent's own recent
+        // engrams + its inbox; absent => brain-wide (unchanged).
+        let agent = q.agent.as_deref().filter(|a| !a.is_empty());
+        let open_todos = match agent {
+            Some(a) => todos::inbox_for_agent(&id, a, false).unwrap_or_default(),
+            None => todos::list_todos(&id, Some("open")).unwrap_or_default(),
+        };
+
+        let db = open_brain(&id)?;
+        let conn = db.lock();
+        let row_to_summary = |r: &rusqlite::Row| {
+            Ok(TopMemorySummary {
+                engram_id: r.get(0)?,
+                title: r.get(1)?,
+                strength: r.get(2)?,
+                state: r.get(3)?,
+                access_count: r.get(4)?,
+            })
+        };
+        let top = match agent {
+            Some(a) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, title, strength, state, access_count \
+                     FROM engrams \
+                     WHERE state != 'dormant' AND agent_id = ?1 \
+                     ORDER BY updated_at DESC, strength DESC LIMIT 5",
+                )?;
+                let rows = stmt
+                    .query_map([a], row_to_summary)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, title, strength, state, access_count \
+                     FROM engrams \
+                     WHERE state != 'dormant' \
+                     ORDER BY strength DESC, access_count DESC LIMIT 5",
+                )?;
+                let rows = stmt
+                    .query_map([], row_to_summary)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            }
+        };
+
+        Ok(SessionStartResponse {
+            brain,
+            stats,
+            core_memory,
+            top_memories: top,
+            open_todos,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+
+    Ok(Json(resp))
+}
+
+// --- GET /api/changes (diff feed) ----------------------------------------
+
+#[derive(Deserialize)]
+pub struct ChangesQuery {
+    since: Option<String>,
+    brain: Option<String>,
+    #[serde(default = "default_changes_limit")]
+    limit: usize,
+}
+
+fn default_changes_limit() -> usize {
+    50
+}
+
+#[derive(Serialize)]
+pub struct ChangeRow {
+    engram_id: String,
+    title: String,
+    updated_at: String,
+    state: String,
+    kind: String,
+}
+
+#[derive(Serialize)]
+pub struct ChangesResponse {
+    changes: Vec<ChangeRow>,
+}
+
+pub async fn changes_feed(
+    Query(q): Query<ChangesQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<ChangesResponse>, ApiError> {
+    let resp = tokio::task::spawn_blocking(move || -> Result<ChangesResponse, MemoryError> {
+        let id = resolve_brain_id(q.brain.as_deref())?;
+        let db = open_brain(&id)?;
+        let conn = db.lock();
+        let limit = q.limit.min(500) as i64;
+        let since = q.since.unwrap_or_default();
+        let mut rows: Vec<ChangeRow> = Vec::new();
+        if since.is_empty() {
+            let mut stmt = conn.prepare(
+                "SELECT id, title, COALESCE(updated_at, ''), state, COALESCE(kind, '') \
+                 FROM engrams ORDER BY updated_at DESC LIMIT ?1",
+            )?;
+            let it = stmt.query_map(rusqlite::params![limit], |r| {
+                Ok(ChangeRow {
+                    engram_id: r.get(0)?,
+                    title: r.get(1)?,
+                    updated_at: r.get(2)?,
+                    state: r.get(3)?,
+                    kind: r.get(4)?,
+                })
+            })?;
+            for row in it {
+                rows.push(row?);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, title, COALESCE(updated_at, ''), state, COALESCE(kind, '') \
+                 FROM engrams WHERE updated_at > ?1 ORDER BY updated_at DESC LIMIT ?2",
+            )?;
+            let it = stmt.query_map(rusqlite::params![since, limit], |r| {
+                Ok(ChangeRow {
+                    engram_id: r.get(0)?,
+                    title: r.get(1)?,
+                    updated_at: r.get(2)?,
+                    state: r.get(3)?,
+                    kind: r.get(4)?,
+                })
+            })?;
+            for row in it {
+                rows.push(row?);
+            }
+        }
+        Ok(ChangesResponse { changes: rows })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+
+    Ok(Json(resp))
+}
+
+// --- /api/core_memory ----------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct CoreMemoryQuery {
+    brain: Option<String>,
+}
+
+pub async fn core_memory_list(
+    Query(q): Query<CoreMemoryQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<Vec<CoreBlock>>, ApiError> {
+    let blocks = tokio::task::spawn_blocking(move || -> Result<Vec<CoreBlock>, MemoryError> {
+        let id = resolve_brain_id(q.brain.as_deref())?;
+        core_memory::list_blocks(&id)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(blocks))
+}
+
+pub async fn core_memory_read(
+    Path(label): Path<String>,
+    Query(q): Query<CoreMemoryQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<Option<CoreBlock>>, ApiError> {
+    let block = tokio::task::spawn_blocking(move || -> Result<Option<CoreBlock>, MemoryError> {
+        let id = resolve_brain_id(q.brain.as_deref())?;
+        core_memory::read_block(&id, &label)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(block))
+}
+
+#[derive(Deserialize)]
+pub struct CoreMemorySetBody {
+    value: String,
+    brain: Option<String>,
+}
+
+pub async fn core_memory_set(
+    Path(label): Path<String>,
+    _s: State<ServerState>,
+    Json(body): Json<CoreMemorySetBody>,
+) -> Result<Json<CoreBlock>, ApiError> {
+    let block = tokio::task::spawn_blocking(move || -> Result<CoreBlock, MemoryError> {
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        core_memory::set_block(&id, &label, body.value)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(block))
+}
+
+#[derive(Deserialize)]
+pub struct CoreMemoryAppendBody {
+    text: String,
+    brain: Option<String>,
+}
+
+pub async fn core_memory_append(
+    Path(label): Path<String>,
+    _s: State<ServerState>,
+    Json(body): Json<CoreMemoryAppendBody>,
+) -> Result<Json<CoreBlock>, ApiError> {
+    let block = tokio::task::spawn_blocking(move || -> Result<CoreBlock, MemoryError> {
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        core_memory::append_block(&id, &label, &body.text)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(block))
+}
+
+#[derive(Deserialize)]
+pub struct CoreMemoryReplaceBody {
+    old: String,
+    new: String,
+    brain: Option<String>,
+}
+
+pub async fn core_memory_replace(
+    Path(label): Path<String>,
+    _s: State<ServerState>,
+    Json(body): Json<CoreMemoryReplaceBody>,
+) -> Result<Json<Option<CoreBlock>>, ApiError> {
+    let block = tokio::task::spawn_blocking(move || -> Result<Option<CoreBlock>, MemoryError> {
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        core_memory::replace_in_block(&id, &label, &body.old, &body.new)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(block))
+}
+
+// --- /api/todos ----------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct TodosListQuery {
+    status: Option<String>,
+    brain: Option<String>,
+}
+
+pub async fn todos_list(
+    Query(q): Query<TodosListQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<Vec<Todo>>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<Todo>, MemoryError> {
+        let id = resolve_brain_id(q.brain.as_deref())?;
+        todos::list_todos(&id, q.status.as_deref())
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+pub struct TodosAddBody {
+    text: String,
+    agent_match: Option<String>,
+    priority: Option<String>,
+    created_by: Option<String>,
+    note: Option<String>,
+    brain: Option<String>,
+}
+
+pub async fn todos_add(
+    _s: State<ServerState>,
+    Json(body): Json<TodosAddBody>,
+) -> Result<Json<Todo>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<Todo, MemoryError> {
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        todos::add_todo(
+            &id,
+            AddTodoArgs {
+                text: body.text,
+                agent_match: body.agent_match,
+                priority: body.priority,
+                created_by: body.created_by,
+                note: body.note,
+                kind: None,
+                payload: None,
+                source_engram: None,
+            },
+        )
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// --- Multi-agent coordination: handoff + agent inbox -----------------------
+// A handoff is a directed todo (kind set) addressed to another agent via
+// agent_match. Inert: it just sits in the inbox until that agent polls and
+// acts. No scheduler, no auto-run — NeuroVault is the shared brain, not a
+// runtime. See docs/specs/agent-coordination.md.
+
+#[derive(Deserialize)]
+pub struct HandoffBody {
+    to_agent: String,
+    #[serde(rename = "type")]
+    kind: String,
+    payload: Option<serde_json::Value>,
+    source_engram: Option<String>,
+    note: Option<String>,
+    from_agent: Option<String>,
+    priority: Option<String>,
+    brain: Option<String>,
+}
+
+pub async fn handoff(
+    _s: State<ServerState>,
+    Json(body): Json<HandoffBody>,
+) -> Result<Json<Todo>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<Todo, MemoryError> {
+        let id = resolve_brain_id(body.brain.as_deref())?;
+        let text = format!("handoff:{}", body.kind);
+        todos::add_todo(
+            &id,
+            AddTodoArgs {
+                text,
+                agent_match: Some(body.to_agent),
+                priority: body.priority,
+                created_by: body.from_agent,
+                note: body.note,
+                kind: Some(body.kind),
+                payload: body.payload,
+                source_engram: body.source_engram,
+            },
+        )
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+pub struct AgentInboxQuery {
+    agent: String,
+    brain: Option<String>,
+}
+
+pub async fn agent_inbox(
+    Query(q): Query<AgentInboxQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<Vec<Todo>>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<Todo>, MemoryError> {
+        let id = resolve_brain_id(q.brain.as_deref())?;
+        // handoffs_only=true: an inbox is inter-agent handoffs, not plain todos.
+        todos::inbox_for_agent(&id, &q.agent, true)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+pub async fn todos_get(
+    Path(id): Path<String>,
+    Query(q): Query<TodosListQuery>,
+    _s: State<ServerState>,
+) -> Result<Json<Option<Todo>>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<Option<Todo>, MemoryError> {
+        let bid = resolve_brain_id(q.brain.as_deref())?;
+        todos::get_todo(&bid, &id)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+pub struct TodosClaimBody {
+    agent_id: String,
+    brain: Option<String>,
+}
+
+pub async fn todos_claim(
+    Path(id): Path<String>,
+    _s: State<ServerState>,
+    Json(body): Json<TodosClaimBody>,
+) -> Result<Json<Option<Todo>>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<Option<Todo>, MemoryError> {
+        let bid = resolve_brain_id(body.brain.as_deref())?;
+        todos::claim_todo(&bid, &id, &body.agent_id)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+pub struct TodosCompleteBody {
+    brain: Option<String>,
+}
+
+pub async fn todos_complete(
+    Path(id): Path<String>,
+    _s: State<ServerState>,
+    Json(body): Json<TodosCompleteBody>,
+) -> Result<Json<Todo>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<Todo, MemoryError> {
+        let bid = resolve_brain_id(body.brain.as_deref())?;
+        todos::complete_todo(&bid, &id)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Drop-folder inbox. Backs the MCP `list_inbox` / `read_inbox_file` /
+// `mark_inbox_done` tools. The inbox is a staging area for raw dropped
+// files; the agent reads them here, writes a clean note into the vault
+// (via the normal remember/save path), then marks the raw file done.
+// See super::inbox for the on-disk semantics.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+pub struct ConflictsQuery2 {
+    #[serde(default)]
+    brain: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// GET /api/conflicts — on-demand sweep for potential contradictions
+/// (mid-similarity note pairs). Backs the `find_conflicts` MCP tool.
+pub async fn conflicts_find(
+    _s: State<ServerState>,
+    Query(q): Query<ConflictsQuery2>,
+) -> Result<Json<Vec<super::ingest::ConflictPair>>, ApiError> {
+    let limit = q.limit.unwrap_or(20).clamp(1, 200);
+    let pairs = tokio::task::spawn_blocking(move || -> Result<_, MemoryError> {
+        let id = resolve_brain_id(q.brain.as_deref())?;
+        let db = open_brain(&id)?;
+        super::ingest::find_conflicts(&db, limit)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(pairs))
+}
+
+#[derive(Deserialize, Default)]
+pub struct DiagnosticQuery {
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+/// GET /api/diagnostic — brain health scorecard. Backs the MCP
+/// `diagnose_brain` tool and the in-app Diagnostic panel.
+pub async fn diagnostic_get(
+    _s: State<ServerState>,
+    Query(q): Query<DiagnosticQuery>,
+) -> Result<Json<super::diagnostic::DiagnosticReport>, ApiError> {
+    let report = tokio::task::spawn_blocking(move || -> Result<_, MemoryError> {
+        let id = resolve_brain_id(q.brain.as_deref())?;
+        let db = open_brain(&id)?;
+        super::diagnostic::diagnose(&db)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(report))
+}
+
+#[derive(Deserialize, Default)]
+pub struct InboxListQuery {
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+pub async fn inbox_list(
+    _s: State<ServerState>,
+    Query(q): Query<InboxListQuery>,
+) -> Result<Json<Vec<super::inbox::InboxFile>>, ApiError> {
+    let brain_id = resolve_brain_id(q.brain.as_deref())?;
+    let files = super::inbox::list_inbox(&brain_id)?;
+    Ok(Json(files))
+}
+
+#[derive(Deserialize)]
+pub struct InboxReadQuery {
+    name: String,
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+pub async fn inbox_read(
+    _s: State<ServerState>,
+    Query(q): Query<InboxReadQuery>,
+) -> Result<Json<super::inbox::InboxFileContent>, ApiError> {
+    let brain_id = resolve_brain_id(q.brain.as_deref())?;
+    let content = super::inbox::read_inbox_file(&brain_id, &q.name)?;
+    Ok(Json(content))
+}
+
+#[derive(Deserialize)]
+pub struct InboxDoneBody {
+    name: String,
+    #[serde(default)]
+    brain: Option<String>,
+}
+
+pub async fn inbox_done(
+    _s: State<ServerState>,
+    Json(body): Json<InboxDoneBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let brain_id = resolve_brain_id(body.brain.as_deref())?;
+    super::inbox::mark_done(&brain_id, &body.name)?;
+    Ok(Json(
+        serde_json::json!({ "status": "ok", "name": body.name }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Per-brain source folders.
+//
+//   GET  /api/brains/:brain_id/sources         — list configured sources,
+//        each enriched with manifest-derived file_count + last_synced.
+//   PUT  /api/brains/:brain_id/sources         — replace the source list
+//        (validates each path is a directory), persist, and if the brain
+//        is active (re)start its mirror watchers + run an initial sync.
+//   POST /api/brains/:brain_id/sources/sync    — force a full re-mirror now
+//        (works whether or not the brain is active).
+//   GET  /api/brains/:brain_id/sources/preview — read-only dry run.
+//
+// Source-folder CONFIG lives in brains.json (canonical config, never only
+// in the rebuildable brain.db). file_count + last_synced are NOT stored in
+// the brain record — they're computed from the per-brain
+// `sources_manifest.json` at response time.
+// ---------------------------------------------------------------------------
+
+/// One source folder in a GET response — config plus manifest-derived
+/// status. Matches the frontend contract exactly.
+#[derive(Serialize)]
+pub struct SourceOut {
+    pub path: String,
+    pub enabled: bool,
+    /// RFC3339 of the most recent sync that touched any file from this
+    /// folder, or null if it has never produced a mirrored note.
+    pub last_synced: Option<String>,
+    /// Number of files this folder currently contributes to the vault.
+    pub file_count: u32,
+}
+
+#[derive(Serialize)]
+pub struct SourcesListResponse {
+    pub sources: Vec<SourceOut>,
+}
+
+/// One source folder in a PUT body — config only (status is derived, never
+/// accepted from the client).
+#[derive(Deserialize)]
+pub struct SourceIn {
+    pub path: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+pub struct SourcesPutBody {
+    pub sources: Vec<SourceIn>,
+}
+
+/// Build the GET response shape for a brain from its registry config +
+/// manifest-derived status. Shared by GET and PUT (which returns the same
+/// shape on success).
+fn sources_response(brain_id: &str) -> Result<SourcesListResponse, ApiError> {
+    let folders = super::read_ops::registry_source_folders(brain_id)?;
+    let sources = folders
+        .into_iter()
+        .map(|f| {
+            let status = super::source_mirror::source_status(brain_id, &f.path);
+            SourceOut {
+                path: f.path,
+                enabled: f.enabled,
+                last_synced: status.last_synced,
+                file_count: status.file_count,
+            }
+        })
+        .collect();
+    Ok(SourcesListResponse { sources })
+}
+
+pub async fn brain_sources_list(
+    Path(brain_id): Path<String>,
+    _s: State<ServerState>,
+) -> Result<Json<SourcesListResponse>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || sources_response(&brain_id))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    Ok(Json(out))
+}
+
+pub async fn brain_sources_set(
+    Path(brain_id): Path<String>,
+    _s: State<ServerState>,
+    Json(body): Json<SourcesPutBody>,
+) -> Result<Json<SourcesListResponse>, ApiError> {
+    let out = tokio::task::spawn_blocking(move || -> Result<SourcesListResponse, ApiError> {
+        // Validate the brain exists (clean 404 rather than a write error).
+        let _ = super::read_ops::registry_source_folders(&brain_id)?;
+
+        // Validate every path is an existing directory FIRST — persist
+        // nothing if any is invalid.
+        for s in &body.sources {
+            if !std::path::Path::new(&s.path).is_dir() {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    format!("{} is not a directory", s.path),
+                ));
+            }
+        }
+
+        let folders: Vec<super::types::SourceFolder> = body
+            .sources
+            .iter()
+            .map(|s| super::types::SourceFolder {
+                path: s.path.clone(),
+                enabled: s.enabled,
+            })
+            .collect();
+
+        // Persist config to brains.json.
+        super::write_ops::set_source_folders(&brain_id, &folders)?;
+
+        // If this is the active brain, (re)start its mirror watchers and run
+        // an initial sync so the new config takes effect now.
+        // restart_for_brain re-reads source_folders + syncs.
+        let active = resolve_brain_id(None).ok();
+        if active.as_deref() == Some(brain_id.as_str()) {
+            let vault = super::read_ops::resolve_vault_path(&brain_id)?;
+            if let Err(e) = super::watcher::restart_for_brain(&brain_id, vault) {
+                eprintln!(
+                    "[brain_sources_set] watcher restart for {} failed: {}",
+                    brain_id, e
+                );
+            }
+        }
+
+        sources_response(&brain_id)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    Ok(Json(out))
+}
+
+#[derive(Serialize)]
+pub struct SourcesSyncResponse {
+    pub synced: u32,
+    pub removed: u32,
+    pub skipped_duplicates: u32,
+}
+
+pub async fn brain_sources_sync(
+    Path(brain_id): Path<String>,
+    _s: State<ServerState>,
+) -> Result<Json<SourcesSyncResponse>, ApiError> {
+    let report = tokio::task::spawn_blocking(move || super::source_mirror::sync(&brain_id))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+    Ok(Json(SourcesSyncResponse {
+        synced: report.synced,
+        removed: report.removed,
+        skipped_duplicates: report.skipped_duplicates,
+    }))
+}
+
+/// GET /api/brains/:brain_id/sources/preview — a read-only dry run: what a
+/// sync WOULD add / update / remove / skip, with no changes to the brain.
+pub async fn brain_sources_preview(
+    Path(brain_id): Path<String>,
+    _s: State<ServerState>,
+) -> Result<Json<super::source_mirror::SyncPlan>, ApiError> {
+    let plan = tokio::task::spawn_blocking(move || super::source_mirror::plan(&brain_id))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+    Ok(Json(plan))
+}
+
+// ---------------------------------------------------------------------------
+// Curator route smoke tests (Wave 3A).
+//
+// Handlers are called directly, the way the rest of this file's tests do
+// it — the router is a thin `.route()` table and axum's extractors are
+// not what these assertions are about.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod curator_route_tests {
+    use super::*;
+
+    struct Env {
+        home: std::path::PathBuf,
+        prev_home: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Env {
+        fn new(name: &str) -> Self {
+            let guard = crate::memory::journal::TEST_HOME_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let home = std::env::temp_dir().join(format!(
+                "nv-curator-routes-{name}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&home).unwrap();
+            let prev_home = std::env::var_os("NEUROVAULT_HOME");
+            std::env::set_var("NEUROVAULT_HOME", &home);
+            Env {
+                home,
+                prev_home,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for Env {
+        fn drop(&mut self) {
+            match &self.prev_home {
+                Some(v) => std::env::set_var("NEUROVAULT_HOME", v),
+                None => std::env::remove_var("NEUROVAULT_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    const BRAIN: &str = "route-brain";
+
+    fn query<T: serde::de::DeserializeOwned>(pairs: &[(&str, &str)]) -> T {
+        let map: std::collections::HashMap<&str, &str> = pairs.iter().copied().collect();
+        serde_json::from_value(serde_json::to_value(map).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn local_curator_put_patches_consent_and_keeps_unknown_keys() {
+        let env = Env::new("config");
+        // A file written by a future build, with a key this one has
+        // never heard of.
+        std::fs::write(
+            env.home.join("local_curator.json"),
+            r#"{"enabled":false,"transcript_access":false,"future_key":{"keep":"me"}}"#,
+        )
+        .unwrap();
+
+        // A closed loopback port: the state probe must never reach the
+        // developer's real Ollama.
+        let port = closed_port().await;
+        let body: LocalCuratorBody = serde_json::from_value(serde_json::json!({
+            "brain": BRAIN,
+            "enabled": true,
+            "transcript_access": true,
+            "provider": {
+                "endpoint": format!("http://127.0.0.1:{port}"),
+                "model": "qwen3:30b",
+                "timeout_control_secs": 1,
+            },
+        }))
+        .unwrap();
+        let Json(out) = local_curator_set(State(ServerState {}), Json(body))
+            .await
+            .expect("put");
+        assert_eq!(out["enabled"], true);
+        assert_eq!(out["consent_granted"], true);
+        assert_eq!(out["provider_configured"], true);
+        assert_eq!(out["schedule"]["interval_hours"], 24);
+        // Due immediately after opting in, and the gate says so.
+        assert_eq!(out["schedule"]["decision"], "run");
+
+        let raw: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(env.home.join("local_curator.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["future_key"]["keep"], "me", "unknown keys survive");
+
+        let Json(got) = local_curator_get(Query(query(&[("brain", BRAIN)])), State(ServerState {}))
+            .await
+            .expect("get");
+        assert_eq!(got["provider"]["model"], "qwen3:30b");
+        assert_eq!(got["transcript_access"], true);
+        drop(env);
+    }
+
+    #[tokio::test]
+    async fn local_curator_put_refuses_a_non_loopback_provider() {
+        let env = Env::new("badprovider");
+        let body: LocalCuratorBody = serde_json::from_value(serde_json::json!({
+            "provider": { "endpoint": "http://evil.example.com", "model": "m" },
+        }))
+        .unwrap();
+        let err = local_curator_set(State(ServerState {}), Json(body))
+            .await
+            .expect_err("must refuse");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(!env.home.join("local_curator.json").exists());
+        drop(env);
+    }
+
+    /// A run is minutes long, so the endpoint must answer in
+    /// milliseconds: 202 + the id the caller polls for.
+    #[tokio::test]
+    async fn curator_run_returns_202_and_a_run_id_without_waiting() {
+        let env = Env::new("run-202");
+        // Consent off: the spawned run records its skip and exits at
+        // once, so the test never depends on a model.
+        std::fs::write(
+            env.home.join("local_curator.json"),
+            r#"{"enabled":false,"transcript_access":false}"#,
+        )
+        .unwrap();
+
+        let body: CuratorRunBody =
+            serde_json::from_value(serde_json::json!({ "brain": BRAIN })).unwrap();
+        let (status, Json(out)) = curator_run(State(ServerState {}), Json(body))
+            .await
+            .expect("accepted");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(out["status"], "running");
+        let run_id = out["run_id"].as_str().expect("run id").to_string();
+        assert!(run_id.starts_with("cr_"), "{run_id}");
+
+        // Let the detached run finish inside THIS temp home before the
+        // env vars are restored.
+        for _ in 0..200 {
+            if super::super::adaptive::curator::schedule::read_last_run(BRAIN).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            super::super::adaptive::curator::schedule::read_last_run(BRAIN).is_some(),
+            "the detached run never ran"
+        );
+        assert!(super::super::adaptive::curator::runner::in_flight_run(BRAIN).is_none());
+        drop(env);
+    }
+
+    #[tokio::test]
+    async fn the_runs_feed_reports_whether_one_is_in_flight() {
+        let env = Env::new("in-flight");
+        let Json(idle) = curator_runs(Query(query(&[("brain", BRAIN)])), State(ServerState {}))
+            .await
+            .expect("runs");
+        assert_eq!(idle["running"], false);
+        assert!(idle["in_flight"].is_null());
+        drop(env);
+    }
+
+    /// The UI sends `provider` only when it has one. An omitted field
+    /// must leave a hand-edited block exactly where it was.
+    /// A loopback port with nothing behind it. Tests must never probe
+    /// the developer's real Ollama — that machine has models installed
+    /// and CI does not.
+    async fn closed_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    #[tokio::test]
+    async fn a_consent_only_put_does_not_clobber_the_provider_block() {
+        let env = Env::new("no-clobber");
+        let port = closed_port().await;
+        std::fs::write(
+            env.home.join("local_curator.json"),
+            format!(
+                r#"{{"enabled":true,"transcript_access":true,
+                "provider":{{"endpoint":"http://127.0.0.1:{port}","model":"hand-edited",
+                "num_ctx":16384,"timeout_control_secs":1}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let body: LocalCuratorBody = serde_json::from_value(serde_json::json!({
+            "brain": BRAIN,
+            "enabled": false,
+            "transcript_access": true,
+        }))
+        .unwrap();
+        let Json(out) = local_curator_set(State(ServerState {}), Json(body))
+            .await
+            .expect("put");
+        assert_eq!(out["enabled"], false);
+        assert_eq!(out["provider"]["model"], "hand-edited");
+        assert_eq!(out["provider"]["num_ctx"], 16384);
+        // …and the platform + status fields the settings panel needs.
+        assert_eq!(out["platform_supported"], cfg!(unix));
+        assert_eq!(out["provider_status"]["ok"], false, "nothing is listening");
+        assert_eq!(out["provider_status"]["code"], "ollama_unreachable");
+        assert!(out["provider_status"]["code"].is_string());
+        assert!(out["provider_status"]["hint"].is_string());
+        assert_eq!(out["installed_models"].as_array().unwrap().len(), 0);
+        drop(env);
+    }
+
+    #[tokio::test]
+    async fn curator_run_is_409_while_the_brain_is_busy() {
+        let env = Env::new("busy");
+        let held = super::super::adaptive::lock::try_acquire_brain_run(BRAIN).unwrap();
+        let body: CuratorRunBody =
+            serde_json::from_value(serde_json::json!({ "brain": BRAIN })).unwrap();
+        let err = curator_run(State(ServerState {}), Json(body))
+            .await
+            .expect_err("busy");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        drop(held);
+        drop(env);
+    }
+
+    /// The documented Wave-3 fix: deterministic consolidation losing the
+    /// same single-flight lock was surfacing as a 500.
+    #[tokio::test]
+    async fn consolidate_is_409_not_500_when_it_loses_the_lock() {
+        let env = Env::new("consolidate-busy");
+        let held = super::super::adaptive::lock::try_acquire_brain_run(BRAIN).unwrap();
+        let body: ConsolidateBody =
+            serde_json::from_value(serde_json::json!({ "brain": BRAIN, "mode": "proposal" }))
+                .unwrap();
+        let err = consolidate_shadow(State(ServerState {}), Json(body))
+            .await
+            .expect_err("busy");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        drop(held);
+        drop(env);
+    }
+
+    #[tokio::test]
+    async fn curator_runs_returns_the_audit_feed_newest_first() {
+        use super::super::adaptive::curator::state;
+        let env = Env::new("runs");
+        let now = time::OffsetDateTime::now_utc();
+        for unit in ["u-one", "u-two"] {
+            let key = state::UnitKey::new(unit, "digest", "2026-08-vp1");
+            let audit = state::CuratorRunAudit::new("cr_test", BRAIN, &key, now)
+                .with_no_proposal_reason(state::NoProposalReason::NoCandidates)
+                .finished_at(now);
+            state::append_audit(BRAIN, &audit).unwrap();
+        }
+        let Json(out) = curator_runs(Query(query(&[("brain", BRAIN)])), State(ServerState {}))
+            .await
+            .expect("runs");
+        assert_eq!(out["count"], 2);
+        assert_eq!(out["runs"][0]["unit_id"], "u-two", "newest first");
+        drop(env);
+    }
+
+    #[tokio::test]
+    async fn span_preview_says_so_when_a_proposal_is_not_a_curator_one() {
+        use super::super::adaptive::proposals::{
+            append, ApplicationStatus, ReviewStatus, StoredProposal,
+        };
+        let env = Env::new("preview");
+        let rec = StoredProposal {
+            proposal_id: "deterministic-1".into(),
+            brain_id: BRAIN.into(),
+            action: "memory_strengthened".into(),
+            memory_type: "engram".into(),
+            object_id: "e-1".into(),
+            title: "t".into(),
+            reason: "r".into(),
+            band: "low".into(),
+            fields: Vec::new(),
+            evidence: vec!["ev-1".into()],
+            review_status: ReviewStatus::Unreviewed,
+            application_status: ApplicationStatus::Pending,
+            application_error: None,
+            proposed_at: "2026-08-12T00:00:00Z".into(),
+            decided_at: None,
+            decided_by: None,
+            decision_reason: None,
+            predecessor: None,
+            curator: None,
+        };
+        append(BRAIN, &rec).unwrap();
+
+        let Json(out) = curator_span_preview(
+            Query(query(&[
+                ("brain", BRAIN),
+                ("proposal_id", "deterministic-1"),
+            ])),
+            State(ServerState {}),
+        )
+        .await
+        .expect("preview");
+        assert_eq!(out["available"], false);
+        assert_eq!(out["code"], "not_a_curator_proposal");
+        drop(env);
+    }
+
+    /// The §1 honesty item, guarded: review-only is a property of which
+    /// action strings have an executor arm in `proposal_approve`. Every
+    /// curator action must fall through to `Ok(None)`, leaving the
+    /// proposal exactly as created — `NotApplicable`, nothing written.
+    #[tokio::test]
+    async fn no_curator_action_has_an_executor_arm() {
+        use super::super::adaptive::curator::policy::CURATOR_ACTIONS;
+        use super::super::adaptive::proposals::{
+            append, load_all, ApplicationStatus, ReviewStatus, StoredProposal,
+        };
+        let env = Env::new("review-only");
+
+        for (index, action) in CURATOR_ACTIONS.iter().enumerate() {
+            let pid = format!("curator-{index}");
+            let rec = StoredProposal {
+                proposal_id: pid.clone(),
+                brain_id: BRAIN.into(),
+                action: (*action).to_string(),
+                memory_type: "engram".into(),
+                object_id: format!("curator/claim-{index}"),
+                title: "Remember: something".into(),
+                reason: "r".into(),
+                band: "medium".into(),
+                fields: Vec::new(),
+                evidence: vec!["ev-1".into()],
+                review_status: ReviewStatus::Unreviewed,
+                // As the converter creates them.
+                application_status: ApplicationStatus::NotApplicable,
+                application_error: None,
+                proposed_at: "2026-08-12T00:00:00Z".into(),
+                decided_at: None,
+                decided_by: None,
+                decision_reason: None,
+                predecessor: None,
+                curator: None,
+            };
+            append(BRAIN, &rec).unwrap();
+
+            let body: ProposalDecisionBody =
+                serde_json::from_value(serde_json::json!({ "brain": BRAIN, "reviewer": "dath" }))
+                    .unwrap();
+            let Json(out) = proposal_approve(
+                axum::extract::Path(pid.clone()),
+                State(ServerState {}),
+                Json(body),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("approve {action}: {}", e.1));
+            assert_eq!(out["apply"], "NotApplicable", "{action} executed");
+
+            let stored = load_all(BRAIN);
+            let after = &stored[&pid];
+            assert_eq!(after.review_status, ReviewStatus::Approved);
+            assert_eq!(
+                after.application_status,
+                ApplicationStatus::NotApplicable,
+                "{action} must have no executor arm in V1"
+            );
+            assert!(after.application_error.is_none());
+        }
+        drop(env);
+    }
+}

@@ -1,0 +1,706 @@
+//! External API gateway — sibling to `super::http_server`.
+//!
+//! The optional external API gateway. The boundary contract:
+//!
+//!   • Loopback path (`http_server`) is **untouched** — same port,
+//!     same routes, same zero-auth trust model.
+//!   • This gateway runs on a separate port, bind configurable,
+//!     bearer auth required for every request, scope check per
+//!     route, audit log per call.
+//!   • Both routers call the same `super::handlers::*` functions.
+//!
+//! Phase 3 ship: scaffold + auth middleware + a single `/v1/status`
+//! endpoint to smoke-test end-to-end. Phases 4-6 add the rest of
+//! the read/write/admin surface.
+//!
+//! The gateway is **default off**. `start_gateway` only fires when
+//! the user explicitly enables it via Settings (Phase 8) or the
+//! `NEUROVAULT_API_GATEWAY=1` env var (developer override for
+//! testing without UI plumbing).
+
+use std::net::SocketAddr;
+
+use axum::extract::{MatchedPath, Request, State};
+use axum::http::{HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Json, Response};
+use axum::routing::{get, post};
+use axum::Router;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tower_http::cors::{Any, CorsLayer};
+
+use super::api_audit::{self, AuditEntry};
+use super::api_keys::{self, AuthedKey, Scope};
+use super::handlers;
+
+// ---------------------------------------------------------------------------
+// Defaults — separate port from the loopback server (8765) so the
+// two can run side-by-side without colliding. User can override via
+// the gateway config file once Phase 8 lands the Settings UI.
+// ---------------------------------------------------------------------------
+
+pub const DEFAULT_GATEWAY_PORT: u16 = 8767;
+
+// ---------------------------------------------------------------------------
+// Lifecycle handle. Mirrors the loopback ServerHandle so the call
+// site (lib.rs / Tauri main / future neurovault-api binary) can
+// stop the gateway the same way it stops the loopback server.
+// ---------------------------------------------------------------------------
+
+pub struct GatewayHandle {
+    pub addr: SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+    join: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl GatewayHandle {
+    pub async fn stop(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bind + lifecycle. `start_gateway` opts the user in explicitly —
+// no surprise network exposure. Caller chooses bind addr + port.
+// ---------------------------------------------------------------------------
+
+/// Persisted gateway configuration. Lives at
+/// `~/.neurovault/api_gateway.json`. Read at app startup by the
+/// Tauri main / standalone server bin to decide whether (and how)
+/// to spawn the gateway. Mutated only via the Settings UI through
+/// `save_config` — the gateway itself never writes this file.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GatewayConfig {
+    /// Master switch. Default false — the gateway doesn't bind a
+    /// port unless the user explicitly turns it on. No surprise
+    /// network exposure on first launch.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind kind. "loopback" = 127.0.0.1, "lan" = 0.0.0.0,
+    /// "specific" = use `bind_ip`. We expose this as a discriminator
+    /// rather than just an IP so the UI can render meaningful radio
+    /// buttons + warnings without parsing the address back.
+    #[serde(default = "default_bind_kind")]
+    pub bind_kind: String,
+    /// Used only when `bind_kind == "specific"`. Free-form so the
+    /// user can paste an IPv6 literal or a specific LAN IP.
+    #[serde(default)]
+    pub bind_ip: Option<String>,
+    /// TCP port. Default `DEFAULT_GATEWAY_PORT` (8767) — separate
+    /// from the loopback server so the two can coexist.
+    #[serde(default = "default_gateway_port")]
+    pub port: u16,
+}
+
+fn default_bind_kind() -> String {
+    "loopback".to_string()
+}
+fn default_gateway_port() -> u16 {
+    DEFAULT_GATEWAY_PORT
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_kind: default_bind_kind(),
+            bind_ip: None,
+            port: DEFAULT_GATEWAY_PORT,
+        }
+    }
+}
+
+impl GatewayConfig {
+    /// Resolve `bind_kind` (+ `bind_ip` for "specific") into a
+    /// concrete `IpAddr` for `start_gateway`.
+    pub fn resolve_bind(&self) -> Result<std::net::IpAddr, String> {
+        match self.bind_kind.as_str() {
+            "loopback" => Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            "lan" => Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            "specific" => self
+                .bind_ip
+                .as_deref()
+                .ok_or_else(|| "bind_kind='specific' requires bind_ip".to_string())
+                .and_then(|s| {
+                    s.parse::<std::net::IpAddr>()
+                        .map_err(|e| format!("invalid bind_ip {:?}: {}", s, e))
+                }),
+            other => Err(format!("unknown bind_kind {:?}", other)),
+        }
+    }
+}
+
+/// Path to the persisted gateway config.
+pub fn config_path() -> std::path::PathBuf {
+    super::paths::nv_home().join("api_gateway.json")
+}
+
+pub fn load_config() -> GatewayConfig {
+    let path = config_path();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return GatewayConfig::default(),
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+pub fn save_config(cfg: &GatewayConfig) -> Result<(), String> {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {}", e))?;
+    }
+    let json = serde_json::to_string_pretty(cfg).map_err(|e| format!("encode: {}", e))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| format!("write tmp: {}", e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {}", e))?;
+    Ok(())
+}
+
+pub async fn start_gateway(cfg: GatewayConfig) -> Result<GatewayHandle, String> {
+    let bind_ip = cfg.resolve_bind()?;
+    let addr = SocketAddr::new(bind_ip, cfg.port);
+
+    let app = router();
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // Same self-heal as the loopback server. Stale
+            // neurovault* on this port → kill + retry; anything
+            // else surfaces as a clear bind error.
+            if super::port_recovery::try_clear_stale_neurovault(cfg.port).is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                TcpListener::bind(addr)
+                    .await
+                    .map_err(|e2| format!("could not bind {} after clearing stale: {}", addr, e2))?
+            } else {
+                return Err(format!(
+                    "could not bind {}: {} (port held by a non-neurovault process)",
+                    addr, e,
+                ));
+            }
+        }
+        Err(e) => return Err(format!("could not bind {}: {}", addr, e)),
+    };
+
+    let bound = listener.local_addr().unwrap_or(addr);
+    let (tx, rx) = oneshot::channel::<()>();
+    let join = tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            })
+            .await;
+    });
+
+    eprintln!(
+        "[api_gateway] listening on {} (bearer auth required)",
+        bound
+    );
+    Ok(GatewayHandle {
+        addr: bound,
+        shutdown: Some(tx),
+        join: Some(join),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Router. Phase 4 mounts the read endpoints from super::handlers.
+// Per-route scope requirements live in `required_scope_for` below;
+// the scope-check middleware reads the matched path and rejects
+// requests whose AuthedKey doesn't satisfy the requirement.
+// ---------------------------------------------------------------------------
+
+fn router() -> Router {
+    Router::new()
+        // Phase 3 — gateway smoke endpoint, any active key
+        .route("/v1/status", get(v1_status))
+        // Phase 4 — READ endpoints. Mirror super::http_server's
+        // mounts but under /v1/ and with auth + scope middleware
+        // applied below.
+        .route("/v1/recall", get(handlers::recall))
+        .route("/v1/recall/chunks", get(handlers::recall_chunks))
+        .route(
+            "/v1/recall_across_brains",
+            get(handlers::recall_across_brains),
+        )
+        .route("/v1/related/:engram_id", get(handlers::related))
+        .route("/v1/notes", get(handlers::notes_list))
+        .route("/v1/notes/:engram_id", get(handlers::notes_detail))
+        .route(
+            "/v1/notes/:engram_id/versions",
+            get(handlers::engram_versions_list),
+        )
+        .route(
+            "/v1/notes/:engram_id/versions/:version",
+            get(handlers::engram_version_get),
+        )
+        .route("/v1/temporal_recall", get(handlers::temporal_recall))
+        .route("/v1/contradictions", get(handlers::contradictions_list))
+        .route("/v1/orphan_links", get(handlers::orphan_links))
+        .route("/v1/clutter", get(handlers::clutter_report))
+        .route("/v1/list_images", get(handlers::list_images))
+        .route("/v1/brains", get(handlers::brains_list))
+        .route("/v1/brains/:brain_id/stats", get(handlers::brains_stats))
+        .route("/v1/session_start", get(handlers::session_start))
+        .route("/v1/changes", get(handlers::changes_feed))
+        .route("/v1/core_memory", get(handlers::core_memory_list))
+        .route("/v1/core_memory/:label", get(handlers::core_memory_read))
+        // POST that's still read-scope: dedupe check is a query, not
+        // a write — body just carries the candidate content.
+        .route("/v1/check_duplicate", post(handlers::check_duplicate))
+        // Phase 5 — WRITE endpoints. Same handlers as the loopback
+        // path, mounted under /v1/. Scope: write (which implies
+        // read via Scope::satisfies).
+        .route("/v1/notes", post(handlers::remember))
+        .route("/v1/notes", axum::routing::put(handlers::notes_save))
+        .route("/v1/notes", axum::routing::delete(handlers::notes_delete))
+        .route("/v1/engrams/delete", post(handlers::engrams_delete))
+        .route("/v1/engrams/bulk_set_kind", post(handlers::bulk_set_kind))
+        .route("/v1/engrams/bulk_add_tag", post(handlers::bulk_add_tag))
+        .route(
+            "/v1/contradictions/:id/resolve",
+            post(handlers::contradictions_resolve),
+        )
+        .route("/v1/links", post(handlers::links_add))
+        .route("/v1/links", axum::routing::delete(handlers::links_remove))
+        .route("/v1/import_folder", post(handlers::import_folder))
+        .route("/v1/update", post(handlers::update_brain))
+        .route(
+            "/v1/core_memory/:label",
+            axum::routing::put(handlers::core_memory_set),
+        )
+        .route(
+            "/v1/core_memory/:label/append",
+            post(handlers::core_memory_append),
+        )
+        .route(
+            "/v1/core_memory/:label/replace",
+            post(handlers::core_memory_replace),
+        )
+        // Phase 6 — ADMIN endpoints. Highest blast radius — VACUUM
+        // the DB, rebuild every embedding, create or switch brains.
+        // Scope: admin (which implies write + read).
+        .route("/v1/optimize_disk", post(handlers::optimize_disk))
+        .route("/v1/reindex_embeddings", post(handlers::reindex_embeddings))
+        .route("/v1/brains", post(handlers::brains_create))
+        .route(
+            "/v1/brains/:brain_id/activate",
+            post(handlers::brains_activate),
+        )
+        // Layer order, innermost → outermost (axum runs them in
+        // reverse-add order, so the last `.layer` is the OUTERMOST):
+        //   handler → scope_check → brain_allowlist → auth → audit
+        //
+        // audit wraps everything so it captures failed auth too
+        // (key_id will be null in those rows). It reads timing
+        // from when the request enters and the final status from
+        // the response — without audit at the outermost, a 401 from
+        // auth_middleware would never get logged.
+        .layer(middleware::from_fn(scope_middleware))
+        .layer(middleware::from_fn(brain_allowlist_middleware))
+        .layer(middleware::from_fn(auth_middleware))
+        .layer(middleware::from_fn(audit_middleware))
+        // CORS: permissive — auth is mandatory regardless of origin,
+        // so the bearer header is the gate, not the page. Tighten
+        // per-key in a future iteration if needed.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
+        // Outermost: contain a handler panic to its own request. This
+        // gateway mounts the SAME handler functions as the loopback
+        // server but can bind beyond loopback (`bind_kind = "lan"`), so
+        // without it a single malformed request from any reachable host
+        // would abort the whole desktop app — a remote DoS on a surface
+        // whose API key the user may have handed to a third party.
+        .layer(tower_http::catch_panic::CatchPanicLayer::new())
+        .with_state(handlers::ServerState {})
+}
+
+// ---------------------------------------------------------------------------
+// Auth middleware — extract Bearer, look up key, attach AuthedKey
+// to request extensions. Reject malformed / missing / unknown /
+// revoked with 401.
+//
+// Per-route scope checks happen DOWNSTREAM of this — handlers (or
+// route-specific layers) read AuthedKey from extensions and decide.
+// Phase 3 ships only /v1/status which any active key may call;
+// Phase 4+ adds per-route scope enforcement.
+// ---------------------------------------------------------------------------
+
+async fn auth_middleware(mut req: Request, next: Next) -> Response {
+    let bearer = match req.headers().get(axum::http::header::AUTHORIZATION) {
+        Some(v) => match v.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                return unauthorized(
+                    "malformed_authorization",
+                    "Authorization header is not valid UTF-8",
+                )
+            }
+        },
+        None => return unauthorized("missing_authorization", "Authorization header required"),
+    };
+    let Some(token) = bearer.strip_prefix("Bearer ") else {
+        return unauthorized("invalid_scheme", "Authorization scheme must be Bearer");
+    };
+    let Some(key) = api_keys::authenticate(token.trim()) else {
+        return unauthorized("invalid_key", "API key not recognised or revoked");
+    };
+
+    // Stash a copy of the key id so the audit middleware can read
+    // it from the final response. The audit layer runs AFTER the
+    // request has been consumed by the handler chain, so the only
+    // way to plumb the id back out is via response extensions.
+    let key_id = key.id.clone();
+    req.extensions_mut().insert(key);
+    let mut response = next.run(req).await;
+    response.extensions_mut().insert(AuditedKeyId(key_id));
+    response
+}
+
+/// Newtype so we can find the key_id specifically in response
+/// extensions (raw `String` would collide with anything else
+/// downstream that inserts a String).
+#[derive(Clone)]
+struct AuditedKeyId(String);
+
+// ---------------------------------------------------------------------------
+// Audit middleware — outermost layer. Captures request entry, runs
+// the chain, writes one ndjson row per request to api_audit.jsonl.
+// Best-effort: a write failure logs to stderr but never affects
+// the response that produced it.
+// ---------------------------------------------------------------------------
+
+async fn audit_middleware(req: Request, next: Next) -> Response {
+    let started = std::time::Instant::now();
+    let method = req.method().to_string();
+
+    // Prefer the matched-path template (e.g. "/v1/notes/:engram_id")
+    // over the concrete path so analytics aren't fragmented by URL
+    // variants. MatchedPath is populated by axum after routing —
+    // for unrouted requests we fall back to the URI path.
+    let path = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+
+    // Brain id from ?brain=  for per-brain analytics.
+    let brain = req
+        .uri()
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == "brain")
+        .map(|(_, v)| urlencoding_decode(v));
+
+    // Best-effort client IP from ConnectInfo. axum exposes this
+    // when the listener was started with `into_make_service_with_
+    // connect_info` — for the v1 gateway we don't, so this stays
+    // None until Phase 11 (headless server) wires that up.
+    let ip: Option<String> = None;
+
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+
+    let key_id = response
+        .extensions()
+        .get::<AuditedKeyId>()
+        .map(|k| k.0.clone());
+
+    let entry = AuditEntry {
+        ts: now_iso8601(),
+        key_id,
+        method,
+        path,
+        status,
+        brain,
+        ip,
+        duration_ms: started.elapsed().as_millis() as u64,
+    };
+    api_audit::record(&entry);
+
+    response
+}
+
+fn now_iso8601() -> String {
+    use time::format_description::well_known::Iso8601;
+    use time::OffsetDateTime;
+    OffsetDateTime::now_utc()
+        .format(&Iso8601::DEFAULT)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Scope check — runs AFTER auth_middleware, so AuthedKey is
+// guaranteed present. Reads the matched route's RequiredScope from
+// the static table; rejects with 403 if the key's scope is too low.
+//
+// The matched-path lookup is what makes this O(1) per request even
+// as the route table grows. Path-templates (e.g. /v1/notes/:id)
+// resolve to their template string, not the concrete URL.
+// ---------------------------------------------------------------------------
+
+/// Look up the required scope for a (method, path) pair. Path is the
+/// matched route template (e.g. "/v1/notes/:engram_id"), method is
+/// the HTTP verb. Method-aware because the same path serves
+/// different scopes at different verbs — GET /v1/notes is read,
+/// POST /v1/notes is write, DELETE /v1/notes is write.
+///
+/// Returns None when no policy is registered. The middleware fails
+/// closed on None — refuse rather than accidentally allow.
+fn required_scope_for(method: &axum::http::Method, path: &str) -> Option<Scope> {
+    use axum::http::Method;
+    // Read scope — GET endpoints + the one POST that's a query
+    // (check_duplicate returns whether content matches existing
+    // engrams; reads no permanent state).
+    if method == Method::GET
+        && matches!(
+            path,
+            "/v1/status"
+                | "/v1/recall"
+                | "/v1/recall/chunks"
+                | "/v1/recall_across_brains"
+                | "/v1/related/:engram_id"
+                | "/v1/notes"
+                | "/v1/notes/:engram_id"
+                | "/v1/notes/:engram_id/versions"
+                | "/v1/notes/:engram_id/versions/:version"
+                | "/v1/temporal_recall"
+                | "/v1/contradictions"
+                | "/v1/orphan_links"
+                | "/v1/clutter"
+                | "/v1/list_images"
+                | "/v1/brains"
+                | "/v1/brains/:brain_id/stats"
+                | "/v1/session_start"
+                | "/v1/changes"
+                | "/v1/core_memory"
+                | "/v1/core_memory/:label"
+        )
+    {
+        return Some(Scope::Read);
+    }
+    if method == Method::POST && path == "/v1/check_duplicate" {
+        return Some(Scope::Read);
+    }
+    // Write scope — mutating endpoints. POST/PUT/DELETE on
+    // engram-affecting paths.
+    let is_write_method = matches!(*method, Method::POST | Method::PUT | Method::DELETE);
+    if is_write_method
+        && matches!(
+            path,
+            "/v1/notes"
+                | "/v1/engrams/delete"
+                | "/v1/engrams/bulk_set_kind"
+                | "/v1/engrams/bulk_add_tag"
+                | "/v1/contradictions/:id/resolve"
+                | "/v1/links"
+                | "/v1/import_folder"
+                | "/v1/update"
+                | "/v1/core_memory/:label"
+                | "/v1/core_memory/:label/append"
+                | "/v1/core_memory/:label/replace"
+        )
+    {
+        return Some(Scope::Write);
+    }
+    // Admin scope — irreversible / brain-lifecycle operations.
+    // optimize_disk + reindex_embeddings touch the entire DB;
+    // brains create + activate change the multi-brain shape and
+    // affect every other key's view of state.
+    if is_write_method
+        && matches!(
+            path,
+            "/v1/optimize_disk"
+                | "/v1/reindex_embeddings"
+                | "/v1/brains"
+                | "/v1/brains/:brain_id/activate"
+        )
+    {
+        return Some(Scope::Admin);
+    }
+    None
+}
+
+async fn scope_middleware(req: Request, next: Next) -> Response {
+    // Phase 3's /v1/status was inside the auth gate but had no scope
+    // table entry — it accepted any active key. Now we treat it as
+    // Read scope explicitly so the table is exhaustive.
+    let path = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string());
+    let Some(path) = path else {
+        // Unmatched route — let axum's 404 handler deal with it
+        // rather than 403. We don't want auth-aware error leakage.
+        return next.run(req).await;
+    };
+    let method = req.method().clone();
+    let Some(required) = required_scope_for(&method, &path) else {
+        // Route exists in the router but no scope policy declared.
+        // Fail closed: refuse rather than accidentally exposing.
+        return forbidden(
+            "no_scope_policy",
+            "no scope policy registered for this route",
+        );
+    };
+    let Some(key) = req.extensions().get::<AuthedKey>() else {
+        // auth_middleware should have populated this. Belt-and-
+        // braces fallback so a misordered layer stack can't bypass.
+        return unauthorized(
+            "auth_missing",
+            "auth middleware did not run before scope check",
+        );
+    };
+    if !key.scope.satisfies(required) {
+        return forbidden(
+            "insufficient_scope",
+            &format!(
+                "this key has {:?} scope; {:?} requires {:?}",
+                key.scope, path, required
+            ),
+        );
+    }
+    next.run(req).await
+}
+
+// ---------------------------------------------------------------------------
+// Brain allowlist — reads ?brain= from the query string and rejects
+// if the AuthedKey's allowlist excludes it. Empty allowlist means
+// all brains permitted; that's the default for new keys.
+//
+// Path-param brains (e.g. /v1/brains/:brain_id/stats) are NOT
+// covered here — those need per-route extraction. For Phase 4 the
+// only path-param brain endpoint is /v1/brains/:brain_id/stats; we
+// guard it with an inline check there as a follow-up if needed.
+// ---------------------------------------------------------------------------
+
+async fn brain_allowlist_middleware(req: Request, next: Next) -> Response {
+    // Only inspect ?brain= when present. No brain param = no
+    // restriction to enforce here (the handler may default to the
+    // active brain, which is a separate concern).
+    let query = req.uri().query().unwrap_or("");
+    let brain_id = query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == "brain")
+        .map(|(_, v)| urlencoding_decode(v));
+    let Some(brain_id) = brain_id else {
+        return next.run(req).await;
+    };
+    let Some(key) = req.extensions().get::<AuthedKey>() else {
+        return next.run(req).await; // auth_middleware will handle this
+    };
+    if !key.may_use_brain(&brain_id) {
+        return forbidden(
+            "brain_not_allowed",
+            &format!("this key's allowlist does not include brain {:?}", brain_id,),
+        );
+    }
+    next.run(req).await
+}
+
+/// Minimal `+`-and-`%XX` decoder. We only need it for the `brain`
+/// query value, which in practice is a UUID-style id with no
+/// percent-escaping. Keeps us from pulling in `urlencoding` or
+/// `serde_urlencoded` as a direct dep.
+fn urlencoding_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'+' {
+            out.push(' ');
+            i += 1;
+        } else if b == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            match (hi, lo) {
+                (Some(h), Some(l)) => {
+                    out.push(((h * 16 + l) as u8) as char);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b as char);
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(b as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn forbidden(error: &'static str, message: &str) -> Response {
+    let body = serde_json::json!({
+        "error": error,
+        "message": message,
+    });
+    (StatusCode::FORBIDDEN, Json(body)).into_response()
+}
+
+fn unauthorized(error: &'static str, message: &str) -> Response {
+    let body = serde_json::json!({
+        "error": error,
+        "message": message,
+    });
+    let mut resp = (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+    // RFC 6750 — clients learn how to authenticate from this header.
+    resp.headers_mut().insert(
+        axum::http::header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer realm=\"neurovault\""),
+    );
+    resp
+}
+
+// ---------------------------------------------------------------------------
+// /v1/status — smoke endpoint. Returns the AuthedKey id + scope so
+// the client can confirm the auth path works end-to-end. No data
+// from the brain leaks here; just "yes, your key was accepted."
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+struct V1StatusResponse {
+    service: &'static str,
+    version: &'static str,
+    authenticated_as: AuthInfo,
+}
+
+#[derive(serde::Serialize)]
+struct AuthInfo {
+    key_id: String,
+    scope: Scope,
+    brain_allowlist: Vec<String>,
+}
+
+async fn v1_status(_state: State<handlers::ServerState>, req: Request) -> Json<V1StatusResponse> {
+    // Auth middleware guarantees this is present.
+    let key = req
+        .extensions()
+        .get::<AuthedKey>()
+        .cloned()
+        .expect("auth_middleware should have inserted AuthedKey");
+    Json(V1StatusResponse {
+        service: "neurovault-api-gateway",
+        version: env!("CARGO_PKG_VERSION"),
+        authenticated_as: AuthInfo {
+            key_id: key.id,
+            scope: key.scope,
+            brain_allowlist: key.brain_allowlist,
+        },
+    })
+}

@@ -1,0 +1,2116 @@
+import { useEffect, useMemo, useRef, useState, useCallback, Suspense, lazy } from "react";
+import { useGraphStore } from "../stores/graphStore";
+import { GraphFilterPanel } from "./GraphFilterPanel";
+import type { SimNode } from "../stores/graphStore";
+import type { GraphEdge } from "../lib/api";
+import { useNoteStore } from "../stores/noteStore";
+import { useBrainStore } from "../stores/brainStore";
+import { useSettingsStore } from "../stores/settingsStore";
+import {
+  PALETTE_NEUTRAL,
+  PALETTES,
+  folderColor,
+  presetRenderer,
+  useGraphSettingsStore,
+  type GraphConnectionMode,
+  type GraphLabelMode,
+  type GraphNodeShape,
+} from "../stores/graphSettingsStore";
+import type { AtlasPatternId } from "../lib/atlasPatterns";
+import { GraphPresetBar } from "./GraphPresetBar";
+import { edgeConfidence, pageRank, louvain, graphCacheKey } from "../lib/graphMetrics";
+import {
+  atlasEdgeTheme,
+  buildEdgeLegendRows,
+  edgeThemeColor,
+  type EdgeLegendRow,
+} from "../lib/graphEdgeLegend";
+import { AnalyticsTipBar } from "./AnalyticsTipBar";
+import { GraphLegend } from "./GraphLegend";
+import { BrainDiagnostic } from "./BrainDiagnostic";
+import { nvSetPagerank, nvSetClusters, nvGetClusterNames, readNote, type NvClusterSummary } from "../lib/tauri";
+import { extractPreview } from "../lib/utils";
+import type { AtlasGraphHandle } from "./AtlasGraph";
+import { buildAtlasVisualModel } from "../lib/atlasVisualModel";
+import { graphSnapshot2D, graphSnapshot3D } from "../lib/graphSnapshots";
+import {
+  INTERACTIVE_WEBGL_RENDERER_CONFIG,
+  canvasToPngBlobWithBackground,
+  copyPngToClipboard,
+  downloadBlob,
+  graphImageFilename,
+  renderThreeGraphToPng,
+  type ThreeGraphCaptureTarget,
+} from "../lib/graphExport";
+import { LabelSpriteCache, isKeyLabelNode, labelText } from "../lib/graphLabelSprite";
+import type { Object3D } from "three";
+import { toast } from "../stores/toastStore";
+
+// react-force-graph ships heavy ThreeJS deps in its 3D variant. Lazy-load so
+// the 2D/Atlas modes don't pull in the whole 3D bundle until
+// the user actually toggles into 3D view. Cuts initial bundle size ~600 KB.
+const ForceGraph2D = lazy(() =>
+  import("react-force-graph-2d").then((m) => ({ default: m.default }))
+);
+const ForceGraph3D = lazy(() =>
+  import("react-force-graph-3d").then((m) => ({ default: m.default }))
+);
+const AtlasGraph = lazy(() =>
+  import("./AtlasGraph").then((m) => ({ default: m.AtlasGraph }))
+);
+
+// STATE_COLORS + STATE_GLOW were removed in the graph-aesthetic
+// redesign (2026-04-23). Node state (fresh/active/dormant) is now
+// encoded as a single alpha channel on the fill, not a separate
+// ring + halo — the previous layered look was too busy on the
+// small node sizes and competed with folder color as the primary
+// identity signal.
+
+/** Edge color by link_type — typed-wikilink vocabulary mapped to a palette
+ *  so the graph communicates relationship semantics at a glance.
+ *  Grouped by intent: structural (blue/purple), dependency (green/teal),
+ *  conflict (red/orange), neutral fallback. */
+function edgeColor(linkType: string, alpha: number): string {
+  switch (linkType) {
+    case "manual":      return `rgba(139, 124, 248, ${alpha})`;
+    case "entity":      return `rgba(0, 201, 177, ${alpha})`;
+    case "defines":     return `rgba(139, 124, 248, ${alpha})`;
+    case "part_of":     return `rgba(100, 140, 240, ${alpha})`;
+    case "extends":     return `rgba(120, 160, 255, ${alpha})`;
+    case "depends_on":  return `rgba(0, 201, 177, ${alpha})`;
+    case "uses":        return `rgba(80, 220, 160, ${alpha})`;
+    case "caused_by":   return `rgba(60, 200, 140, ${alpha})`;
+    case "works_at":    return `rgba(40, 190, 180, ${alpha})`;
+    case "contradicts": return `rgba(255, 100, 100, ${alpha})`;
+    case "supersedes":  return `rgba(255, 165, 80, ${alpha})`;
+    case "mentions":    return `rgba(150, 150, 170, ${alpha})`;
+    case "calls":       return `rgba(245, 195, 80, ${alpha})`;
+    default:            return `rgba(122, 119, 154, ${alpha})`;
+  }
+}
+
+/** The radius the fixed snapshot actually paints.
+ *
+ *  THE painter, the pointer hit area and the focus pulse must all call this.
+ *  They used to disagree: the painter had this curve inline (cap 4.8 px) while
+ *  the hit area and pulse used a separate `effectiveNodeRadius` (cap 9-11 px,
+ *  plus an Analytics PageRank boost). The click target was ~2.7x the visible
+ *  dot, so you could click blank canvas and select a note, and the pulse ring
+ *  bloomed from the wrong size. The removed function's own comment warned
+ *  about exactly this -- "centralised so the painter, the pointer hit area and
+ *  the collision force agree" -- and then the snapshot painter drifted off it.
+ *
+ *  Sized by DEGREE: importance in a knowledge graph is how often a note is
+ *  referenced, not how often it was clicked. sqrt keeps the long tail
+ *  compressed so superhubs don't dominate. Community anchors get a flat
+ *  bump instead of scaling, so the eye reads structure, not magnitude. */
+function snapshotNodeRadius(
+  node: { degree?: number; labelRank?: number },
+  nodeCount: number,
+  nodeSizeScale: number,
+): number {
+  const degree = Math.max(0, node.degree ?? 0);
+  const anchor = isKeyLabelNode(node.labelRank, nodeCount);
+  return Math.min(4.8, anchor ? 3.2 : 1.65 + Math.sqrt(degree) * 0.24) * nodeSizeScale;
+}
+
+/** Trace a node-shape path on the given canvas context. Caller is
+ *  responsible for `fill()` / `stroke()` afterwards. The shape is one
+ *  of the user-pickable presets (circle / square / hex); circle is the
+ *  default. Square draws as a rounded rect inscribed in the same
+ *  bounding circle so visually-equivalent footprint is preserved.
+ *  Hex draws a flat-top regular hexagon with the same circumradius. */
+function drawNodeShape(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  r: number,
+  shape: GraphNodeShape,
+): void {
+  ctx.beginPath();
+  if (shape === "square") {
+    // Rounded rect — corner radius proportional to the node so small
+    // nodes still read as squarish, large nodes feel softer.
+    const side = r * 1.7;
+    const half = side / 2;
+    const radius = Math.min(r * 0.25, half);
+    if (typeof ctx.roundRect === "function") {
+      ctx.roundRect(cx - half, cy - half, side, side, radius);
+    } else {
+      // Fallback for ancient browsers that miss roundRect.
+      ctx.rect(cx - half, cy - half, side, side);
+    }
+  } else if (shape === "hex") {
+    // Flat-top hexagon. 6 vertices at 0, 60, 120, ... degrees.
+    for (let i = 0; i < 6; i++) {
+      const angle = (Math.PI / 3) * i;
+      const x = cx + r * Math.cos(angle);
+      const y = cy + r * Math.sin(angle);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  } else {
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  }
+}
+
+
+// A sprite cache (getNodeSprite), desaturateHex and lighten/darken helpers
+// lived here to make the live 2D simulation's per-frame orb painting
+// affordable: gradients and shadowBlur baked once per (colour, size, shape)
+// at 6x supersample, then stamped. The everyday views became fixed snapshots
+// painting a much simpler node, which left all of it unreachable. Removed
+// 2026-07 with the rest of the simulation wiring.
+
+
+
+/** Turn a CSS/hex color into an rgba() with the given alpha. Handles
+ *  both `#rrggbb` + `rgba(...)` input shapes — folder colors are hex,
+ *  node glow colors are rgba already. Pure function; hoisted outside
+ *  the component so useCallback deps don't churn every render. */
+function withAlpha(c: string, alpha: number): string {
+  if (c.startsWith("#") && c.length === 7) {
+    const r = parseInt(c.slice(1, 3), 16);
+    const g = parseInt(c.slice(3, 5), 16);
+    const b = parseInt(c.slice(5, 7), 16);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
+  if (c.startsWith("rgba(")) {
+    // Replace the last comma-separated value (alpha).
+    return c.replace(/,\s*[\d.]+\)$/, `, ${alpha})`);
+  }
+  return c;
+}
+
+/** Custom d3-force that pulls each node toward its folder's centroid.
+ *  Makes folders visibly cluster on the graph without destroying the
+ *  natural link-based layout — the link + charge forces still run, this
+ *  is just an extra nudge. Strength is gentle (0.08) so tightly-linked
+ *  cross-folder notes still pull together when the edges are strong.
+ *
+ *  Runs per simulation tick; centroids are recomputed every call so
+ *  dragging one cluster away moves the pull point with it.
+ */
+/** Convex hull via the monotone-chain (Andrew's) algorithm. O(n log n).
+ *  Returns the hull vertices in CCW order. Used to outline a category's
+ *  members as a "venn"-style polygon in hull grouping mode. Degenerate
+ *  inputs (<3 pts, or all collinear) return the input as-is. */
+function convexHull(points: Array<{ x: number; y: number }>): Array<{ x: number; y: number }> {
+  if (points.length < 3) return points.slice();
+  const pts = points.slice().sort((a, b) => (a.x - b.x) || (a.y - b.y));
+  const cross = (o: { x: number; y: number }, a: { x: number; y: number }, b: { x: number; y: number }) =>
+    (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const lower: typeof pts = [];
+  for (const p of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2]!, lower[lower.length - 1]!, p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  const upper: typeof pts = [];
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i]!;
+    while (upper.length >= 2 && cross(upper[upper.length - 2]!, upper[upper.length - 1]!, p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  lower.pop();
+  upper.pop();
+  return lower.concat(upper);
+}
+
+// "2d" and "3d" are fixed snapshots: pan/zoom/hover/click all work, but the
+// coordinates are pinned and no simulation runs, so there is no per-frame
+// physics loop burning CPU. "engine" is the Sigma/WebGL composition gallery.
+// (This comment described a fourth "static" mode that no longer exists.)
+type GraphViewMode = "2d" | "3d" | "engine";
+
+interface HoverCard {
+  node: SimNode;
+  screenX: number;
+  screenY: number;
+  preview: string;
+}
+
+interface NeuralGraphProps {
+  /** Called after the user clicks "View note" so the parent can switch
+   * back to the Editor view. */
+  onOpenNote?: () => void;
+}
+
+export function NeuralGraph({ onOpenNote }: NeuralGraphProps = {}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const graphTheme = useSettingsStore((state) => state.theme);
+  const [size, setSize] = useState({ w: 800, h: 600 });
+  // The view is one persisted preset in graphSettingsStore; `mode` is only
+  // which renderer draws it. Nothing here owns view state any more.
+  const preset = useGraphSettingsStore((s) => s.preset);
+  const setPreset = useGraphSettingsStore((s) => s.setPreset);
+  const mode: GraphViewMode = presetRenderer(preset);
+  // Ref to the 3D force-graph instance so we can attach an UnrealBloomPass
+  // once the Three.js renderer/composer is available. The ref is passed
+  // to ForceGraph3D as-is; we narrow at the use site.
+  const fg3dRef = useRef<unknown>(undefined);
+  const fg2dRef = useRef<unknown>(undefined);
+  const cameraFrameTokenRef = useRef(0);
+  const atlasRef = useRef<AtlasGraphHandle>(null);
+  // Master performance switch. "lite" derives a low-power preset at read
+  // time — the individual settings below are shadowed when lite is on, so
+  // the user's real preferences are preserved and restored on switch back.
+  // ("off" is handled at the mount site in App.tsx; the component never
+  // renders in that mode.)
+  const graphMode = useGraphSettingsStore((s) => s.graphMode);
+  const lite = graphMode === "lite";
+
+
+  const { nodes: rawNodes, edges: rawEdges, loadGraph, setSelected } = useGraphStore();
+  const focusRequest = useGraphStore((s) => s.focusRequest);
+  const selectNote = useNoteStore((s) => s.selectNote);
+  const createNote = useNoteStore((s) => s.createNote);
+  const allNotes = useNoteStore((s) => s.notes);
+
+  // User-pickable graph appearance: palette, node shape, cluster-label
+  // toggle. Selecting individually so a change to one doesn't rerender
+  // consumers of the others (Zustand subscribes per-selector).
+  const palette = useGraphSettingsStore((s) => s.palette);
+  const nodeShape = useGraphSettingsStore((s) => s.nodeShape);
+  const showClusterLabelsRaw = useGraphSettingsStore((s) => s.showClusterLabels);
+  // User colour overrides — folder name → hex, cluster name → hex.
+  // Selecting individually so a change to one doesn't rerender the
+  // other consumer.
+  const folderColors = useGraphSettingsStore((s) => s.folderColors);
+  const clusterColors = useGraphSettingsStore((s) => s.clusterColors);
+  // Analytics-mode master toggle + per-layer toggles. The master
+  // gates whether anything analytics-y renders at all; the per-layer
+  // booleans decide which specific overlays light up.
+  const analyticsModeRaw = useGraphSettingsStore((s) => s.analyticsMode);
+  const toggleAnalyticsMode = useGraphSettingsStore((s) => s.toggleAnalyticsMode);
+  const analyticsGroupByCommunity = useGraphSettingsStore((s) => s.analyticsGroupByCommunity);
+  const showSemanticEdgesRaw = useGraphSettingsStore((s) => s.showSemanticEdges);
+  // -- v0.1.8 graph filter panel inputs ----------------------------------
+  const searchQuery = useGraphSettingsStore((s) => s.searchQuery);
+  const showOrphansRaw = useGraphSettingsStore((s) => s.showOrphans);
+  const manualOnlyRaw = useGraphSettingsStore((s) => s.manualOnly);
+  const showCodeRaw = useGraphSettingsStore((s) => s.showCode);
+  const nodeSizeScale = useGraphSettingsStore((s) => s.nodeSizeScale);
+  const linkThicknessScale = useGraphSettingsStore((s) => s.linkThicknessScale);
+  const showArrows = useGraphSettingsStore((s) => s.showArrows);
+  const timelapseSpeedSec = useGraphSettingsStore((s) => s.timelapseSpeedSec);
+  const groupingStyleRaw = useGraphSettingsStore((s) => s.groupingStyle);
+  const labelMode = useGraphSettingsStore((s) => s.labelMode);
+  const setLabelMode = useGraphSettingsStore((s) => s.setLabelMode);
+  const connectionMode = useGraphSettingsStore((s) => s.connectionMode);
+  const setConnectionMode = useGraphSettingsStore((s) => s.setConnectionMode);
+
+  // Lite preset: derive the cheap overrides from `lite` so the user's
+  // persisted choices are untouched and snap back when they pick Full again.
+  // (Semantic-edge hairball off, code layer off, orphans hidden, manual-only
+  // edges, no cluster labels, soft tints, analytics off.)
+  const showSemanticEdges = lite ? false : showSemanticEdgesRaw;
+  const showOrphans = lite ? false : showOrphansRaw;
+  const manualOnly = lite ? true : manualOnlyRaw;
+  const showCode = lite ? false : showCodeRaw;
+  const showClusterLabels = lite ? false : showClusterLabelsRaw;
+  const analyticsMode = lite ? false : analyticsModeRaw;
+  const groupingStyle = lite ? "soft" : groupingStyleRaw;
+
+  // Lite mode drops the high-volume `semantic` edges at the SOURCE (server
+  // SQL), so the low-power view never transfers or simulates the hairball.
+  // Full mode keeps every edge (instant client-side semantic toggle stays
+  // unchanged). Flipping mode re-fetches (it's in the load effect deps).
+  const graphExcludeTypes = useMemo<string[]>(() => (lite ? ["semantic"] : []), [lite]);
+
+  // Filter panel open/close state — local, not persisted.
+  const [filterPanelOpen, setFilterPanelOpen] = useState(false);
+
+  // Refresh: re-pull the graph from the backend (uncached GET /api/graph)
+  // so newly-indexed notes / fresh edges show up without restarting. The
+  // brief spinner gives the click feedback even when the reload is fast.
+  const [refreshing, setRefreshing] = useState(false);
+  const handleRefresh = useCallback(async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await loadGraph(graphExcludeTypes);
+    } finally {
+      // Keep the spinner up a beat so a sub-100ms reload still reads as
+      // an action rather than a flicker.
+      setTimeout(() => setRefreshing(false), 400);
+    }
+  }, [refreshing, loadGraph, graphExcludeTypes]);
+
+  // Time-lapse: when active, nodes appear progressively in
+  // chronological order. tlStartMs is the wall-clock start of the
+  // current playback (null = idle); tlProgress drifts 0..1 from a
+  // requestAnimationFrame loop. paintNode2D / linkWidth gate
+  // rendering on the per-node fraction (sorted ascending by
+  // created_at index).
+  const [tlStartMs, setTlStartMs] = useState<number | null>(null);
+  const [tlProgress, setTlProgress] = useState(1);
+  const tlActive = tlStartMs != null;
+
+
+  // Every visible mode exports an actual PNG. Atlas renders a temporary Sigma
+  // image; 2D captures its fixed canvas. The 3D path renders one explicit
+  // frame before encoding, so its interactive renderer never has to retain
+  // every drawing buffer just in case the user later exports.
+  const captureGraphPng = useCallback(async (): Promise<Blob | null> => {
+    const container = containerRef.current;
+    if (!container) return null;
+    if (mode === "engine") {
+      const blob = await atlasRef.current?.exportPng();
+      return blob ?? null;
+    }
+    if (mode === "3d") {
+      if (!fg3dRef.current) return null;
+      return renderThreeGraphToPng(fg3dRef.current as ThreeGraphCaptureTarget);
+    }
+    // force-graph mounts the visible scene canvas first and may mount a second
+    // canvas for pointer picking, so take the first explicitly rather than
+    // relying on there being only one.
+    const canvas = container.querySelector("canvas") as HTMLCanvasElement | null;
+    if (!canvas) return null;
+    // The 2D canvas is transparent (backgroundColor="rgba(0,0,0,0)"); its
+    // backdrop is CSS on the container, which toBlob() cannot see. Composite
+    // the theme background in or the PNG exports invisible on light surfaces.
+    return canvasToPngBlobWithBackground(canvas, graphTheme.bg);
+  }, [mode, graphTheme.bg]);
+
+  const handleSaveImage = useCallback(async () => {
+    try {
+      const blob = await captureGraphPng();
+      if (!blob) {
+        toast.warning("The graph is still preparing. Try Save image again in a moment.");
+        return;
+      }
+      downloadBlob(blob, graphImageFilename());
+      toast.success("Graph saved as a PNG image");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Couldn't save the graph image");
+    }
+  }, [captureGraphPng]);
+
+  const handleCopyImage = useCallback(async () => {
+    try {
+      const blob = await captureGraphPng();
+      if (!blob) {
+        toast.warning("The graph is still preparing. Try Copy image again in a moment.");
+        return;
+      }
+      await copyPngToClipboard(blob);
+      toast.success("Graph image copied");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Couldn't copy the graph image");
+    }
+  }, [captureGraphPng]);
+
+  // Filter the raw edges from the store BEFORE anything else consumes
+  // them. Three layers stack:
+  //   1. manualOnly  → keep only `manual` (typed [[wikilinks]])
+  //   2. showSemanticEdges=false → drop `semantic` (auto cosine)
+  //   3. otherwise → keep everything
+  // The downstream graphData / adjacency / bidi memos read this
+  // filtered list, so the visual graph and the hover-focus
+  // neighbourhood match what the user actually wrote.
+  // Code layer: when hidden, drop kind="code" nodes AND every edge touching
+  // them — a dangling source/target would crash the force simulation.
+  const codeIds = useMemo<Set<string>>(
+    () => new Set(rawNodes.filter((n) => n.kind === "code").map((n) => n.id)),
+    [rawNodes],
+  );
+  // Auto-degrade: past this many nodes the glassy sprite paint cannot
+  // hold 60fps on any setting, so the flat-fill path kicks in
+  // automatically (the user's explicit Lite toggle still forces it at
+  // any size). Declared before `nodes` via function hoisting is not
+  // possible for consts, so it lives just above the first use below.
+  const nodes = useMemo(
+    () => (showCode ? rawNodes : rawNodes.filter((n) => n.kind !== "code")),
+    [rawNodes, showCode],
+  );
+  const edges = useMemo(() => {
+    let list = rawEdges;
+    if (!showCode && codeIds.size > 0) {
+      list = list.filter((e) => !codeIds.has(e.from) && !codeIds.has(e.to));
+    }
+    if (manualOnly) return list.filter((e) => e.link_type === "manual");
+    if (!showSemanticEdges) return list.filter((e) => e.link_type !== "semantic");
+    return list;
+  }, [rawEdges, codeIds, showCode, showSemanticEdges, manualOnly]);
+  const semanticEdgeCount = useMemo(
+    () => rawEdges.filter((e) => e.link_type === "semantic").length,
+    [rawEdges],
+  );
+
+  // Lower-cased search query, computed once. Empty → no filter.
+  const searchLower = searchQuery.trim().toLowerCase();
+  // Per-node "match" set: which nodes pass the current search. Empty
+  // search → null (every node passes; we skip the dim path entirely).
+  const searchMatches = useMemo<Set<string> | null>(() => {
+    if (!searchLower) return null;
+    const out = new Set<string>();
+    for (const n of nodes) {
+      if (n.title.toLowerCase().includes(searchLower)) out.add(n.id);
+    }
+    return out;
+  }, [nodes, searchLower]);
+
+  // Time-lapse fractions — index of each node in created-at order, /
+  // (count - 1). Recomputed when the node set changes. Used by paint
+  // gating during playback. We use access_count as a fallback when
+  // a node has no created_at (some legacy rows). The fraction is
+  // stable across the lifetime of a node so the simulation forces
+  // do not need to be re-attached.
+  const tlFractions = useMemo<Map<string, number>>(() => {
+    // Sort key: prefer created_at (true chronology), fall back to
+    // updated_at, then to id. The old code keyed on updated_at ONLY —
+    // when a batch import gives every note the same updated_at, every
+    // node shares fraction 0 and they all pop in at once (the "time-lapse
+    // doesn't work" bug). created_at is distinct per note so playback
+    // now reveals nodes progressively; id is a final stable tiebreak.
+    const tlKey = (n: SimNode) => {
+      const o = n as { created_at?: string; updated_at?: string };
+      return o.created_at || o.updated_at || n.id;
+    };
+    const sorted = [...nodes].sort((a, b) => {
+      const cmp = tlKey(a).localeCompare(tlKey(b));
+      return cmp !== 0 ? cmp : a.id.localeCompare(b.id);
+    });
+    const m = new Map<string, number>();
+    if (sorted.length === 0) return m;
+    if (sorted.length === 1) {
+      m.set(sorted[0]!.id, 0);
+      return m;
+    }
+    sorted.forEach((n, i) => m.set(n.id, i / (sorted.length - 1)));
+    return m;
+  }, [nodes]);
+
+  // Drive the playback animation. Updates tlProgress every animation
+  // frame from tlStartMs. Auto-stops when progress hits 1.
+  useEffect(() => {
+    if (tlStartMs == null) return;
+    let raf = 0;
+    const totalMs = Math.max(1000, timelapseSpeedSec * 1000);
+    const tick = () => {
+      const now = performance.now();
+      const p = Math.min(1, (now - tlStartMs) / totalMs);
+      setTlProgress(p);
+      if (p < 1) raf = requestAnimationFrame(tick);
+      else setTlStartMs(null);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [tlStartMs, timelapseSpeedSec]);
+
+  const startTimelapse = useCallback(() => {
+    setTlProgress(0);
+    setTlStartMs(performance.now());
+  }, []);
+  const stopTimelapse = useCallback(() => {
+    setTlStartMs(null);
+    setTlProgress(1);
+  }, []);
+
+  // Helper: is this node visible at the current playback progress?
+  // Always true when not playing back. During playback, true only
+  // when the node's chronological fraction is at or before the
+  // current progress.
+  const isNodeVisibleAtTl = useCallback(
+    (id: string): boolean => {
+      if (!tlActive) return true;
+      const f = tlFractions.get(id);
+      return f == null ? true : f <= tlProgress;
+    },
+    [tlActive, tlFractions, tlProgress],
+  );
+  const atlasVisibleNodeIds = useMemo<Set<string> | null>(() => {
+    if (!tlActive) return null;
+    return new Set(nodes.filter((node) => isNodeVisibleAtTl(node.id)).map((node) => node.id));
+  }, [isNodeVisibleAtTl, nodes, tlActive]);
+
+  // Cmd+Shift+A toggles analytics. Cmd+A is select-all in editor
+  // contexts, hence the Shift disambiguator. Skipped if focus is in
+  // an input so the user can still type "A" inside the search box.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || !e.shiftKey) return;
+      if (e.key !== "A" && e.key !== "a") return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
+        return;
+      }
+      e.preventDefault();
+      toggleAnalyticsMode();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [toggleAnalyticsMode]);
+
+  const activeBrainId = useBrainStore((s) => s.activeBrainId);
+  const brains = useBrainStore((s) => s.brains);
+  const notesList = useNoteStore((s) => s.notes);
+  const brainName = brains.find((b) => b.id === activeBrainId)?.name ?? "vault";
+  const [diagnosticOpen, setDiagnosticOpen] = useState(false);
+  // Reload immediately when the brain switches. Note edits are handled by
+  // the debounced effect below: re-fetching the whole graph + re-heating the
+  // simulation on EVERY note save (i.e. every keystroke) was the dominant
+  // source of perceived lag with the graph open on a large brain.
+  // Reload on brain switch AND when the performance mode flips (Lite drops
+  // semantic edges server-side, so changing mode needs a re-fetch with the
+  // right exclude set).
+  useEffect(() => { loadGraph(graphExcludeTypes); }, [loadGraph, activeBrainId, graphExcludeTypes]);
+  const notesReloadInitRef = useRef(true);
+  useEffect(() => {
+    // Skip the first run (the brain-switch effect already loaded), then
+    // debounce: refresh the graph ~3s after the user stops editing, not on
+    // every keystroke-driven notesList change.
+    if (notesReloadInitRef.current) { notesReloadInitRef.current = false; return; }
+    const t = window.setTimeout(() => { loadGraph(graphExcludeTypes); }, 3000);
+    return () => window.clearTimeout(t);
+  }, [loadGraph, notesList, graphExcludeTypes]);
+
+  // Pulse-ring state. `focusPulse` carries the node id + start time
+  // of the most recent focus request. The per-frame renderer reads
+  // elapsed time and draws a fading ring around the node; cleared
+  // ~1.5s after the request. Separate from `focusedNodeId` (which is
+  // the hover-dim state) because the two are independent signals.
+  const [focusPulse, setFocusPulse] = useState<{ nodeId: string; start: number } | null>(null);
+
+  // Wake the 2D graph's camera to the focused node + kick off the
+  // pulse ring whenever the store fires a new `requestFocus`. Runs
+  // only when the request timestamp changes; repeated focus requests
+  // for the same node still re-tween because `at` bumps each call.
+  //
+  // `lastHandledAtRef` guards against re-firing when the `nodes`
+  // array reference shuffles (graph reload, ResizeObserver, etc.).
+  // Without it, any unrelated state churn would yank the user's
+  // wheel-zoom back to 2.2× because the effect would re-run with a
+  // still-set `focusRequest`.
+  const lastHandledAtRef = useRef<number>(0);
+  useEffect(() => {
+    if (!focusRequest) return;
+    if (focusRequest.at === lastHandledAtRef.current) return;
+    lastHandledAtRef.current = focusRequest.at;
+    if (mode === "engine") {
+      // Atlas is lazy-loaded. A command-palette focus can arrive while its
+      // chunk is still resolving, so retry briefly instead of losing the
+      // one-shot request after marking its timestamp handled.
+      let attempts = 0;
+      const focusAtlas = (): boolean => {
+        const atlas = atlasRef.current;
+        if (!atlas) return false;
+        atlas.focusNode(focusRequest.nodeId);
+        atlas.pulse(focusRequest.nodeId);
+        return true;
+      };
+      if (focusAtlas()) return;
+      const retry = window.setInterval(() => {
+        attempts += 1;
+        if (focusAtlas() || attempts >= 20) window.clearInterval(retry);
+      }, 100);
+      return () => window.clearInterval(retry);
+    }
+    // Static shares the ForceGraph2D ref + d3-zoom camera, so it tweens
+    // exactly like 2d. Only 3D needs a different (camera-position) API.
+    if (mode === "3d") return;
+    const target = (nodes as Array<SimNode & { x?: number; y?: number }>)
+      .find((n) => n.id === focusRequest.nodeId);
+    if (!target || target.x == null || target.y == null) return;
+
+    type CamApi = {
+      centerAt?: (x: number, y: number, ms?: number) => void;
+      zoom?: (scale: number, ms?: number) => void;
+    };
+    const fg = fg2dRef.current as CamApi | undefined;
+    // centerAt tweens the camera over `ms`; zoom slides the zoom
+    // factor over the same duration so both land together.
+    fg?.centerAt?.(target.x, target.y, 450);
+    fg?.zoom?.(2.2, 450);
+
+    setFocusPulse({ nodeId: focusRequest.nodeId, start: Date.now() });
+    // Clear the pulse after its animation window. Using a timeout
+    // instead of a prop-driven render loop keeps idle frames at zero.
+    const id = window.setTimeout(() => setFocusPulse(null), 1500);
+    return () => window.clearTimeout(id);
+  }, [focusRequest, mode, nodes]);
+
+  // Fit is the only permanent camera control; wheel/pinch/drag handle the
+  // rest without adding a row of chrome to the snapshot.
+  const frame3DSnapshot = useCallback((duration = 0) => {
+    const token = ++cameraFrameTokenRef.current;
+    const baseRadius = Math.max(90, Math.min(220, 9 * Math.sqrt(Math.max(1, nodes.length))));
+    const distance = baseRadius * 3.62 + 44;
+    let attempts = 0;
+    const apply = (): void => {
+      if (cameraFrameTokenRef.current !== token) return;
+      type Cam3 = {
+        cameraPosition: (
+          position: { x: number; y: number; z: number },
+          lookAt?: { x: number; y: number; z: number },
+          ms?: number,
+        ) => unknown;
+      };
+      const fg = fg3dRef.current as Cam3 | undefined;
+      if (fg?.cameraPosition) {
+        fg.cameraPosition({ x: 0, y: 0, z: distance }, { x: 0, y: 0, z: 0 }, duration);
+        return;
+      }
+      attempts += 1;
+      if (attempts < 24) window.setTimeout(apply, 75);
+    };
+    apply();
+  }, [nodes.length]);
+
+  const handleZoomFit = useCallback(() => {
+    if (mode === "engine") {
+      atlasRef.current?.fit();
+      return;
+    }
+    // Static reframes via the 2d zoomToFit; only 3d uses the 3d ref.
+    if (mode !== "3d") {
+      type CamApi = { zoomToFit: (ms?: number, padding?: number) => unknown };
+      const fg = fg2dRef.current as CamApi | undefined;
+      fg?.zoomToFit?.(400, 80);
+    } else {
+      // ForceGraph3D's bbox can still be origin-sized while its lazy Three
+      // renderer is mounting. Frame the known fixed shell directly instead
+      // of letting an early zoomToFit place the camera inside the sphere.
+      frame3DSnapshot(400);
+    }
+  }, [frame3DSnapshot, mode]);
+
+  useEffect(() => {
+    if (mode === "engine" || nodes.length === 0) return;
+    const timeout = window.setTimeout(handleZoomFit, 320);
+    return () => {
+      window.clearTimeout(timeout);
+      cameraFrameTokenRef.current += 1;
+    };
+  }, [edges.length, handleZoomFit, mode, nodes.length]);
+
+  // Fly the camera to fit a single community's nodes. `zoomToFit` takes
+  // an optional node-filter as its 3rd arg, so we reuse it rather than
+  // computing a centroid by hand. Lives behind the analytics legend's
+  // cluster rows — clicking a cluster frames it.
+  const focusClusterRef = useRef<Map<string, number> | null>(null);
+  const handleFocusCluster = useCallback((comId: number) => {
+    const com = focusClusterRef.current;
+    const inCluster = (n: unknown) => com?.get((n as SimNode).id) === comId;
+    if (mode === "engine") {
+      atlasRef.current?.fitNodes(nodes.filter((node) => inCluster(node)).map((node) => node.id));
+      return;
+    }
+    type CamApi = { zoomToFit: (ms?: number, padding?: number, filter?: (n: unknown) => boolean) => unknown };
+    // Static and 2d both drive the ForceGraph2D ref; only 3d uses fg3dRef.
+    const fg = (mode === "3d" ? fg3dRef.current : fg2dRef.current) as CamApi | undefined;
+    fg?.zoomToFit?.(500, 120, inCluster);
+  }, [mode, nodes]);
+
+  // During the pulse window, kick a per-frame repaint so the ring
+  // actually animates. force-graph's internal render loop goes idle
+  // after cooldown; `tickFrame()` on the ref forces a single paint.
+  // Only runs while a pulse is active; idle frames stay free.
+  useEffect(() => {
+    if (!focusPulse) return;
+    let raf = 0;
+    const tick = () => {
+      const fg = fg2dRef.current as { tickFrame?: () => void } | undefined;
+      fg?.tickFrame?.();
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [focusPulse]);
+
+  // Container resize → re-measure so ForceGraph fills the pane.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const measure = () => {
+      const r = el.getBoundingClientRect();
+      setSize({ w: Math.max(100, r.width), h: Math.max(100, r.height) });
+    };
+    measure();
+    const obs = new ResizeObserver(measure);
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, []);
+
+  // react-force-graph wants {nodes, links} with source/target keys. Our
+  // store uses edges with from/to. Remap once per change.
+  //
+  // Also precompute two side-indexes the render path needs:
+  //   - `bidiEdges`: set of "a|b" (sorted) pairs where BOTH directions
+  //     exist. We curve these apart visually so A→B and B→A don't
+  //     stack on top of each other. Half the edges in a semantic brain
+  //     are bidirectional so this matters a lot.
+  //   - `adjacency`: node_id → set of neighbour ids. Used by the
+  //     hover-focus mode to dim everything outside the 1-hop
+  //     neighbourhood of the hovered node.
+  const graphData = useMemo(() => {
+    const directedSeen = new Set<string>();
+    const bidi = new Set<string>();
+    for (const e of edges) {
+      const key = `${e.from}|${e.to}`;
+      const rev = `${e.to}|${e.from}`;
+      if (directedSeen.has(rev)) {
+        // Canonicalise on sorted pair so both edges get the same lookup key.
+        const [a, b] = e.from < e.to ? [e.from, e.to] : [e.to, e.from];
+        bidi.add(`${a}|${b}`);
+      }
+      directedSeen.add(key);
+    }
+
+    const adjacency = new Map<string, Set<string>>();
+    const addEdge = (from: string, to: string) => {
+      let s = adjacency.get(from);
+      if (!s) { s = new Set(); adjacency.set(from, s); }
+      s.add(to);
+    };
+    for (const e of edges) { addEdge(e.from, e.to); addEdge(e.to, e.from); }
+
+    // Pin isolated nodes (degree 0) onto concentric rings AROUND the
+    // connected brain. The connected graph clusters near (0,0) by
+    // d3-force defaults; orphans form an outer halo at radii 280+.
+    // Reads as: "your brain is the centre, these notes haven't been
+    // integrated yet but they're not lost."
+    //
+    // Packing: walk outward, each ring sized to keep neighbour
+    // spacing ≈ 22 px. 250 orphans → 3 rings (~80/88/97 capacity at
+    // r=280/310/340). Sort order is by node id so the rings are the
+    // same on every reload.
+    const isolatedIds: string[] = [];
+    for (const n of nodes) {
+      if ((adjacency.get(n.id)?.size ?? 0) === 0) isolatedIds.push(n.id);
+    }
+    isolatedIds.sort();
+
+    // Geometry: scales with the size of the connected cluster so a
+    // brain with 50 notes, 500 notes, or 5000 notes all read at the
+    // right density.
+    //
+    // d3-force packs nodes into a roughly disk-shaped area; per-node
+    // area at our draw scale is ~22²/π ≈ 154 px², so the cluster
+    // radius is approximately sqrt(N) * 22. We then place the first
+    // orphan ring 80 px outside that estimate, which gives connected
+    // outliers (drift past the natural cluster edge) somewhere to
+    // sit without crossing the halo.
+    //
+    // No more `showSemanticEdges ? 460 : 280` switch — the formula
+    // handles it automatically. Semantic OFF: connectedCount is low,
+    // ring is tight. Semantic ON: connectedCount is high, ring
+    // expands. Same code path for both.
+    const connectedCount = nodes.length - isolatedIds.length;
+    const estClusterR = Math.max(150, Math.sqrt(connectedCount) * 22);
+    const SPACING = 22;
+    const FIRST_RING_R = estClusterR + 80;
+    const RING_GAP = 32;
+    const orphanPos = new Map<string, { fx: number; fy: number }>();
+    let placed = 0;
+    let ringIdx = 0;
+    while (placed < isolatedIds.length) {
+      const r = FIRST_RING_R + ringIdx * RING_GAP;
+      const capacity = Math.max(1, Math.floor((2 * Math.PI * r) / SPACING));
+      const taking = Math.min(capacity, isolatedIds.length - placed);
+      // Stagger every other ring by half-step so adjacent rings
+      // don't have nodes pointing at the same angle (Moiré-like
+      // aliasing when two close rings are perfectly aligned).
+      const angleOffset = ringIdx % 2 === 0 ? 0 : Math.PI / taking;
+      for (let i = 0; i < taking; i++) {
+        const angle = (i / taking) * 2 * Math.PI + angleOffset;
+        const id = isolatedIds[placed + i];
+        if (!id) continue;
+        orphanPos.set(id, {
+          fx: r * Math.cos(angle),
+          fy: r * Math.sin(angle),
+        });
+      }
+      placed += taking;
+      ringIdx += 1;
+    }
+
+    return {
+      // Attach `degree` to each node so nodeRadius() can read it directly
+      // without a Map lookup. Degree is the number of distinct neighbours
+      // (undirected); matches what the user sees as "lines coming out of
+      // this node" in the graph view. Orphans also get fx/fy from the
+      // grid layout above so they snap to the shelf.
+      nodes: nodes.map((n) => {
+        const degree = adjacency.get(n.id)?.size ?? 0;
+        const pos = orphanPos.get(n.id);
+        return pos ? { ...n, degree, fx: pos.fx, fy: pos.fy } : { ...n, degree };
+      }),
+      links: edges.map((e: GraphEdge) => ({
+        source: e.from,
+        target: e.to,
+        similarity: e.similarity,
+        link_type: e.link_type,
+      })),
+      bidi,
+      adjacency,
+    };
+  }, [nodes, edges, showSemanticEdges]);
+
+  // Both everyday views consume one sparse, deterministic visual model.
+  // Positions are pure functions of graph content: no warm-up, no settling,
+  // and no layout drift between visits. The snapshot only changes when the
+  // underlying notes or relationships change.
+  const snapshotModel = useMemo(
+    () => buildAtlasVisualModel({ nodes: [...nodes], edges: [...edges] }),
+    [nodes, edges],
+  );
+
+  const snapshotLinks = useMemo(() => {
+    if (connectionMode === "off") return [];
+    // The visual model already reduces thousands of relations to a truthful
+    // connectivity backbone. Do not sparsify it a second time: that turns a
+    // coherent snapshot into disconnected confetti.
+    const visibleEdges = connectionMode === "featured"
+      ? snapshotModel.edges.filter((edge) => edge.tier !== "detail")
+      : snapshotModel.edges;
+    return visibleEdges.map((edge) => ({
+      source: edge.source,
+      target: edge.target,
+      from: edge.source,
+      to: edge.target,
+      similarity: edge.maxSimilarity,
+      link_type: edge.primaryType,
+      tier: edge.tier,
+    }));
+  }, [connectionMode, snapshotModel.edges, snapshotModel.nodes]);
+
+  const snapshot2DData = useMemo(() => {
+    const positions = graphSnapshot2D(snapshotModel);
+    return {
+      ...graphData,
+      nodes: snapshotModel.nodes.map((node) => {
+        const point = positions[node.id] ?? { x: 0, y: 0 };
+        return {
+          ...node,
+          x: point.x,
+          y: point.y,
+          fx: point.x,
+          fy: point.y,
+          vx: 0,
+          vy: 0,
+          pinned: true,
+        };
+      }),
+      // Own copies. force-graph resolves link.source from an id string into the
+      // actual node OBJECT and writes it back onto the link, so a shared array
+      // would leave 3D holding 2D's nodes (and vice versa). See snapshot3DData.
+      links: snapshotLinks.map((link) => ({ ...link })),
+    };
+  }, [graphData, snapshotLinks, snapshotModel]);
+
+  const snapshot3DData = useMemo(() => {
+    const positions = graphSnapshot3D(snapshotModel);
+    return {
+      ...graphData,
+      nodes: snapshotModel.nodes.map((node) => {
+        const point = positions[node.id] ?? { x: 0, y: 0, z: 0 };
+        return {
+          ...node,
+          x: point.x,
+          y: point.y,
+          z: point.z,
+          fx: point.x,
+          fy: point.y,
+          fz: point.z,
+          vx: 0,
+          vy: 0,
+          vz: 0,
+          pinned: true,
+        };
+      }),
+      // Own copies — this is the bug that made 3D draw links that connect
+      // nothing. Both snapshots used to share ONE snapshotLinks array while
+      // each built FRESH node objects. d3-force resolved link.source from the
+      // "id" string into a 2D node object and wrote it back; d3-force-3d then
+      // saw `typeof link.source === "object"` and skipped re-resolution, so 3D
+      // links stayed bound to 2D nodes and were drawn at the 2D packing radius
+      // (~330) flattened to z=0, while 3D nodes sit on a Fibonacci shell of
+      // radius 90-220. Wrong space, wrong plane, touching no node.
+      links: snapshotLinks.map((link) => ({ ...link })),
+    };
+  }, [graphData, snapshotLinks, snapshotModel]);
+
+  // Cache key for analytics computations — same brain state = same key.
+  // Used by the analyticsData memo below so toggling analytics off and
+  // back on doesn't recompute when nothing has changed.
+  const analyticsKey = useMemo(
+    () => graphCacheKey(nodes, edges),
+    [nodes, edges]
+  );
+
+  // PageRank + Louvain are only computed when the user actually flips
+  // Analytics on. Off path = zero cost, identical render to v0.1.0.
+  // useMemo cache invalidates on cacheKey change, so adding/removing
+  // notes recomputes; toggling analytics on/off does not.
+  const analyticsData = useMemo<{
+    pr: Map<string, number>;
+    com: Map<string, number>;
+    communitySizes: Map<number, number>;
+  } | null>(() => {
+    if (!analyticsMode) return null;
+    if (nodes.length === 0) {
+      return { pr: new Map(), com: new Map(), communitySizes: new Map() };
+    }
+    const pr = pageRank(nodes, edges);
+    const com = louvain(nodes, edges);
+    const communitySizes = new Map<number, number>();
+    for (const c of com.values()) {
+      communitySizes.set(c, (communitySizes.get(c) ?? 0) + 1);
+    }
+    return { pr, com, communitySizes };
+    // analyticsKey is part of deps via the cache-key sentinel; including
+    // it explicitly is what makes the memo refresh on graph change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [analyticsMode, analyticsKey]);
+
+  // Mirror the community map into a ref so the legend's cluster-focus
+  // handler (declared earlier, near the camera controls) can read the
+  // latest mapping without taking analyticsData as a dependency.
+  useEffect(() => {
+    focusClusterRef.current = analyticsData?.com ?? null;
+  }, [analyticsData]);
+
+  // (Hover-driven tip bar copy lives further down, after focusedNodeId
+  //  is declared.)
+
+  // Track hover node and its screen position (set from onNodeHover).
+  const [hoverCard, setHoverCard] = useState<HoverCard | null>(null);
+  const previewCacheRef = useRef<Record<string, string>>({});
+  const closeTimerRef = useRef<number | null>(null);
+  const cancelClose = useCallback(() => {
+    if (closeTimerRef.current !== null) {
+      window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+  }, []);
+  const scheduleClose = useCallback((delayMs: number = 220) => {
+    if (closeTimerRef.current !== null) return;
+    closeTimerRef.current = window.setTimeout(() => {
+      setHoverCard(null);
+      closeTimerRef.current = null;
+    }, delayMs);
+  }, []);
+  useEffect(() => () => cancelClose(), [cancelClose]);
+
+  const loadPreview = useCallback(async (node: SimNode): Promise<string> => {
+    if (previewCacheRef.current[node.id]) return previewCacheRef.current[node.id]!;
+    const match = allNotes.find((n) => n.title === node.title);
+    if (!match) return "";
+    try {
+      const content = await readNote(match.filename);
+      const preview = extractPreview(content);
+      previewCacheRef.current[node.id] = preview;
+      return preview;
+    } catch { return ""; }
+  }, [allNotes]);
+
+  const handleNodeHover = useCallback((node: unknown) => {
+    if (!node) {
+      scheduleClose();
+      setFocusedNodeId(null);
+      return;
+    }
+    cancelClose();
+    const n = node as SimNode & { x?: number; y?: number };
+    // Turn on focus dim so the 1-hop neighbourhood pops while everything
+    // else fades. Cleared in the `!node` branch above when the cursor
+    // leaves the node area.
+    setFocusedNodeId(n.id);
+    // For 2D mode, x/y are in graph space; the ForceGraph2D ref would be
+    // needed to project to screen coords. Simpler: we anchor the hover
+    // card near the cursor via a mousemove handler on the container.
+    // But for 3D mode, the projection isn't straightforward. So we just
+    // center the card horizontally in the container for 3D, and use the
+    // last-known mouse position for 2D.
+    loadPreview(n).then((preview) => {
+      setHoverCard((prev) => ({
+        node: n,
+        screenX: prev?.screenX ?? size.w / 2 - 130,
+        screenY: prev?.screenY ?? 60,
+        preview,
+      }));
+    });
+  }, [cancelClose, scheduleClose, loadPreview, size.w]);
+
+  const lastMouseRef = useRef({ x: 0, y: 0 });
+  const handleContainerMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    const r = containerRef.current?.getBoundingClientRect();
+    if (!r) return;
+    lastMouseRef.current = { x: e.clientX - r.left, y: e.clientY - r.top };
+  }, []);
+
+  // Reposition hover card to track the last mouse position.
+  useEffect(() => {
+    if (!hoverCard) return;
+    const { x, y } = lastMouseRef.current;
+    const cardW = 260, cardH = 180;
+    const sx = x + 20 + cardW > size.w ? Math.max(10, x - cardW - 20) : x + 20;
+    const sy = Math.max(10, Math.min(size.h - cardH - 10, y - 40));
+    if (sx !== hoverCard.screenX || sy !== hoverCard.screenY) {
+      setHoverCard((p) => p ? { ...p, screenX: sx, screenY: sy } : p);
+    }
+  }, [hoverCard, size.w, size.h]);
+
+  const handleNodeClick = useCallback((node: unknown) => {
+    const n = node as SimNode;
+    cancelClose();
+    setSelected(n.id);
+    const match = allNotes.find((m) => m.title === n.title);
+    if (match) {
+      selectNote(match.filename);
+      setHoverCard(null);
+      onOpenNote?.();
+    }
+  }, [cancelClose, setSelected, allNotes, selectNote, onOpenNote]);
+
+  const handleViewNote = useCallback((node: SimNode) => {
+    cancelClose();
+    setSelected(node.id);
+    const match = allNotes.find((m) => m.title === node.title);
+    if (match) {
+      selectNote(match.filename);
+      setHoverCard(null);
+      onOpenNote?.();
+    }
+  }, [cancelClose, setSelected, allNotes, selectNote, onOpenNote]);
+
+  const [atlasFallbackNotice, setAtlasFallbackNotice] = useState<string | null>(null);
+  const handleAtlasRuntimeError = useCallback((error: Error) => {
+    console.error("Composition renderer unavailable; returning to the 2D snapshot", error);
+    setAtlasFallbackNotice("That composition could not start on this graphics device. The 2D map is still available.");
+    // No "last snapshot" to restore: with one preset bar there is no separate
+    // workspace to leave, so a WebGL failure falls back to the preset that
+    // needs no WebGL at all.
+    setPreset("2d");
+  }, [setPreset]);
+
+  // Hover-focus state. When set, `paintNode2D` dims every node that
+  // isn't the hovered node or one of its 1-hop neighbours. Same story
+  // for `linkColor`. This turns a hairball of 30k edges into a
+  // reading-friendly subgraph on the fly.
+  const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null);
+
+  // Cluster readout for the analytics legend — the same Louvain
+  // communities we push to the backend, kept in React state so the
+  // on-canvas legend can list them (name, size, colour, anchor note)
+  // and let the user click one to fly the camera to it.
+  type LegendCluster = { id: number; size: number; color: string; name: string; topTitle: string };
+  const [legendClusters, setLegendClusters] = useState<LegendCluster[]>([]);
+
+  // Clear stale focus when the graph reloads (brain switch, ingest).
+  // Otherwise a previously-hovered node id can outlive its node and
+  // silently dim the whole new graph because the adjacency lookup
+  // returns nothing.
+  useEffect(() => {
+    if (!focusedNodeId) return;
+    if (!nodes.some((n) => n.id === focusedNodeId)) {
+      setFocusedNodeId(null);
+    }
+  }, [nodes, focusedNodeId]);
+
+  // Push PageRank scores to the Rust retriever whenever they change.
+  // The retriever applies a gentle ln-based multiplier during recall
+  // when state is non-empty for the active brain. Pushing an empty
+  // object on Analytics-off clears state so recall returns to the
+  // un-boosted baseline — Analytics mode IS the gate.
+  useEffect(() => {
+    if (analyticsMode && analyticsData) {
+      const scores: Record<string, number> = {};
+      for (const [id, v] of analyticsData.pr) scores[id] = v;
+      nvSetPagerank(scores, activeBrainId ?? undefined);
+    } else {
+      nvSetPagerank({}, activeBrainId ?? undefined);
+    }
+  }, [analyticsMode, analyticsData, activeBrainId]);
+
+  // Cluster names (community id → human label), loaded from disk
+  // when Analytics mode flips on or the active brain changes. The
+  // /name-clusters skill writes these via the Rust HTTP endpoint;
+  // the frontend reads here so labels surface in the tip bar.
+  const [clusterNames, setClusterNames] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (!analyticsMode) {
+      setClusterNames({});
+      return;
+    }
+    let cancelled = false;
+    nvGetClusterNames(activeBrainId ?? undefined).then((names) => {
+      if (!cancelled) setClusterNames(names);
+    });
+    return () => { cancelled = true; };
+  }, [analyticsMode, activeBrainId, analyticsKey]);
+
+  // Push cluster summaries to the Rust HTTP server whenever Louvain
+  // produces fresh communities. The agent-driven /name-clusters
+  // skill reads these via GET /api/clusters and proposes names.
+  // Empty array clears state when Analytics is disabled.
+  useEffect(() => {
+    if (!analyticsMode || !analyticsData) {
+      nvSetClusters([], activeBrainId ?? undefined);
+      setLegendClusters([]);
+      return;
+    }
+    // Build a top-N-titles + sample-links payload per community.
+    // Top-titles by PageRank within the community (best signal for
+    // theming); sample_links from edge endpoints already inside
+    // graphData. Capped to keep MCP payload ergonomic.
+    const byCommunity = new Map<number, { id: string; pr: number; title: string; folder?: string }[]>();
+    for (const n of nodes) {
+      const c = analyticsData.com.get(n.id);
+      if (c == null) continue;
+      const pr = analyticsData.pr.get(n.id) ?? 0;
+      let arr = byCommunity.get(c);
+      if (!arr) { arr = []; byCommunity.set(c, arr); }
+      arr.push({ id: n.id, pr, title: n.title, folder: (n as { folder?: string }).folder });
+    }
+    const summaries: NvClusterSummary[] = [];
+    const legend: LegendCluster[] = [];
+    for (const [cid, members] of byCommunity) {
+      members.sort((a, b) => b.pr - a.pr);
+      const topMembers = members.slice(0, 5);
+      const top_titles = topMembers.map((m) => m.title);
+      // Sample links: edges where both endpoints are in this cluster.
+      // Cap at 10 — agents need a flavour, not the full subgraph.
+      const memberIds = new Set(members.map((m) => m.id));
+      const sample_links: string[] = [];
+      for (const e of edges) {
+        if (sample_links.length >= 10) break;
+        if (memberIds.has(e.from) && memberIds.has(e.to)) {
+          sample_links.push(`${e.from} → ${e.to} (${e.link_type})`);
+        }
+      }
+      summaries.push({
+        id: cid,
+        size: members.length,
+        top_titles,
+        sample_links,
+      });
+      // Legend entry: colour matches the tint (cluster-name override →
+      // anchor note's folder colour). Name = user-given cluster name, else
+      // the top note's title as a stand-in.
+      const cname = clusterNames[String(cid)];
+      const color = (cname && clusterColors[cname])
+        ? clusterColors[cname]!
+        : folderColor(members[0]?.folder ?? `__comm_${cid}`, palette, folderColors);
+      legend.push({
+        id: cid,
+        size: members.length,
+        color,
+        name: cname || (members[0]?.title ?? `Cluster ${cid}`),
+        topTitle: members[0]?.title ?? "",
+      });
+    }
+    legend.sort((a, b) => b.size - a.size);
+    nvSetClusters(summaries, activeBrainId ?? undefined);
+    setLegendClusters(legend);
+  }, [analyticsMode, analyticsData, activeBrainId, nodes, edges, clusterNames, clusterColors, palette, folderColors]);
+
+  // Hover-driven tip bar copy. Active only in Analytics mode; falls
+  // through to the idle copy when nothing meaningful is hovered.
+  // PR mean is 1.0 by design — 2.0+ is a hub, 0.5- is peripheral.
+  // Cluster name (when set via /name-clusters) replaces "a cluster"
+  // with the actual theme — "in 'API design' (12 notes)".
+  const tipBarHoverText = useMemo<string | null>(() => {
+    if (!analyticsMode || !analyticsData || !focusedNodeId) return null;
+    const pr = analyticsData.pr.get(focusedNodeId) ?? 0;
+    const com = analyticsData.com.get(focusedNodeId);
+    const size = com != null ? analyticsData.communitySizes.get(com) ?? 0 : 0;
+    const clusterLabel =
+      com != null && clusterNames[String(com)]
+        ? `'${clusterNames[String(com)]}' (${size} notes)`
+        : `a cluster of ${size} linked notes`;
+    if (pr >= 2.0) {
+      return size > 1
+        ? `Core note · ${pr.toFixed(1)}× the average reference rate · in ${clusterLabel}`
+        : `Core note · ${pr.toFixed(1)}× the average reference rate`;
+    }
+    if (size >= 3) return `In ${clusterLabel}`;
+    if (pr <= 0.5) return `Peripheral note · few links to the rest of this vault`;
+    return null;
+  }, [analyticsMode, analyticsData, focusedNodeId, clusterNames]);
+
+  // Custom 2D node renderer. "Glass-orb" aesthetic with state-driven
+  // finish:
+  //   - Each node is filled with a 3-stop radial gradient (light → base
+  //     → slightly dark) centred ~30% top-left so it reads like a small
+  //     marble lit from over the shoulder. Beats flat fill at making
+  //     the canvas feel like an actual object scene.
+  //   - A small specular highlight (white, soft) reinforces the orb
+  //     read on circles + hexes. Skipped on squares (looks weird) and
+  //     on tiny / focus-dimmed nodes (would just be noise).
+  //   - Dormant state desaturates the base colour (true grey-shift,
+  //     not just alpha) so the canvas reads "live vs. archived" at a
+  //     glance instead of "bright vs. dim".
+  //   - Fresh state gets a 1-px brand-blue halo — same brand colour as the
+  //     status pill — so newly-arrived notes pop without screaming.
+  //   - 0.5-px dark rim still drawn last so light nodes separate from
+  //     light edges.
+  const paintNode2D = useCallback((rawNode: unknown, ctx: CanvasRenderingContext2D, globalScale: number) => {
+    const node = rawNode as SimNode & {
+      x?: number;
+      y?: number;
+      degree?: number;
+      labelRank?: number;
+      communityId?: number | null;
+    };
+    if (node.x == null || node.y == null) return;
+    // Always true where this runs: ForceGraph2D is rendered only when mode is
+    // neither "engine" nor "3d", and GraphViewMode has no fourth value. The
+    // guard stays as a cheap assertion; ~177 lines of live-simulation painting
+    // used to sit after it, permanently unreachable, and were removed in
+    // 2026-07 with the rest of the force wiring.
+    if (mode === "2d") {
+      const degree = Math.max(0, node.degree ?? 0);
+      const orphan = degree === 0;
+      if ((orphan && !showOrphans) || !isNodeVisibleAtTl(node.id)) return;
+
+      const keyLimit = Math.max(6, Math.ceil(nodes.length * 0.025));
+      const keyNode = (node.labelRank ?? Number.POSITIVE_INFINITY) < keyLimit;
+      const communityColors = PALETTES[palette];
+      const communityColor = node.communityId == null
+        ? folderColor(node.folder ?? "", palette, folderColors)
+        : communityColors[Math.abs(node.communityId) % communityColors.length]!;
+      const color = folderColors[node.folder ?? ""] ?? communityColor;
+      const searchAlpha = searchMatches && !searchMatches.has(node.id) ? 0.12 : 1;
+      const neighbours = focusedNodeId ? graphData.adjacency.get(focusedNodeId) : null;
+      const inFocus = !focusedNodeId || focusedNodeId === node.id || neighbours?.has(node.id) === true;
+      const stateAlpha = node.state === "dormant" ? 0.5 : 0.9;
+      const alpha = stateAlpha * searchAlpha * (inFocus ? 1 : 0.08) * (orphan ? 0.55 : 1);
+      const radius = snapshotNodeRadius(node, nodes.length, nodeSizeScale);
+
+      ctx.save();
+      if (keyNode && inFocus) {
+        ctx.shadowColor = withAlpha(color, 0.55);
+        ctx.shadowBlur = 7;
+      }
+      drawNodeShape(ctx, node.x, node.y, radius, nodeShape);
+      ctx.fillStyle = withAlpha(color, alpha);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      if (keyNode || node.state === "fresh") {
+        drawNodeShape(ctx, node.x, node.y, radius + 1.7 / Math.max(1, globalScale), nodeShape);
+        ctx.lineWidth = 0.7 / Math.max(1, globalScale);
+        ctx.strokeStyle = withAlpha(color, alpha * 0.68);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      const focusedLabel = focusedNodeId === node.id;
+      const showName = labelMode === "key"
+        ? keyNode
+        : labelMode === "all" && (globalScale >= 1.2 || keyNode);
+      if (labelMode !== "off" && (showName || focusedLabel)) {
+        const fontSize = (focusedLabel ? 11 : 9.5) / Math.max(1, globalScale);
+        const label = node.title.length > 30 ? `${node.title.slice(0, 28)}…` : node.title;
+        ctx.save();
+        ctx.font = `${fontSize}px "Geist", system-ui, sans-serif`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.fillStyle = withAlpha(graphTheme.text, inFocus ? 0.86 : 0.35);
+        ctx.fillText(label, node.x, node.y + radius + 4 / Math.max(1, globalScale));
+        ctx.restore();
+      }
+      return;
+    }
+  }, [focusedNodeId, graphData.adjacency, palette, folderColors, nodeShape, analyticsMode, analyticsData, isNodeVisibleAtTl, searchMatches, showOrphans, nodeSizeScale, clusterColors, lite, nodes.length, labelMode, mode, graphTheme]);
+
+  // Pointer hit area for custom-drawn nodes — drawn in the same shape so
+  // hover/click respond where the node visually is.
+  const paintPointerArea2D = useCallback((rawNode: unknown, color: string, ctx: CanvasRenderingContext2D) => {
+    const node = rawNode as SimNode & { x?: number; y?: number; degree?: number; labelRank?: number };
+    if (node.x == null || node.y == null) return;
+    // Same radius the painter draws, +2px of touch slop. Anything more and the
+    // click target stops matching the dot the user is aiming at.
+    const r = snapshotNodeRadius(node, nodes.length, nodeSizeScale) + 2;
+    ctx.fillStyle = color;
+    drawNodeShape(ctx, node.x, node.y, r, nodeShape);
+    ctx.fill();
+  }, [nodeShape, nodes.length, nodeSizeScale]);
+
+  /** Native hover tooltip for edges. react-force-graph-2d reads this
+   *  and renders a lightweight DOM tooltip on mouseover — no extra
+   *  state plumbing on our end. Format: "uses · 0.87" so the reader
+   *  sees both the relationship type AND how strong it is. */
+  const linkLabel = useCallback((rawLink: unknown) => {
+    const l = rawLink as { similarity: number; link_type: string };
+    const sim = l.similarity.toFixed(2);
+    return `${l.link_type} · ${sim}`;
+  }, []);
+
+  /** Cluster-label renderer — draws the folder name at each cluster's
+   *  centroid on top of the force graph. Runs once per frame via
+   *  `onRenderFramePost`, after all nodes + links have painted.
+   *
+   *  Why on the canvas vs HTML overlay: we get the correct zoom
+   *  transform + DPR handling for free, and the labels follow the
+   *  sim without any projection math on our end. `globalScale` is the
+   *  zoom factor so we shrink the font as the user zooms out (keeps
+   *  labels legible without dominating the view).
+   *
+   *  Uses folder color at low opacity so labels feel "of" the cluster
+   *  rather than pasted on top. Root-level notes (folder === "") are
+   *  labelled "Root" only when they're a meaningful group (>2 nodes).
+   */
+  const paintClusterLabels = useCallback((ctx: CanvasRenderingContext2D, globalScale: number) => {
+    if (!nodes.length) return;
+
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    // Two render modes (controlled by the Settings → Graph toggle):
+    //
+    //   1. showClusterLabels = false  (default after Phase 4):
+    //        Render NO labels by default. When the user hovers a
+    //        node, label only that node's cluster. Keeps the canvas
+    //        clean for screenshots and reading.
+    //
+    //   2. showClusterLabels = true:
+    //        Render all clusters with ≥5 members at all zoom levels
+    //        below 2.0×. The original behaviour — for users who want
+    //        the orientation aid permanently visible.
+    if (showClusterLabels) {
+      if (globalScale > 2.0) {
+        // Skip — user is zoomed in reading titles directly.
+      } else {
+        const sums = new Map<string, { x: number; y: number; n: number }>();
+        for (const n of nodes as Array<SimNode & { x?: number; y?: number; folder?: string }>) {
+          if (n.x == null || n.y == null) continue;
+          const key = n.folder ?? "";
+          const s = sums.get(key);
+          if (s) { s.x += n.x; s.y += n.y; s.n += 1; }
+          else sums.set(key, { x: n.x, y: n.y, n: 1 });
+        }
+        for (const [folder, s] of sums) {
+          if (s.n < 5) continue;
+          const cx = s.x / s.n;
+          const cy = s.y / s.n;
+          const color = folder === ""
+            ? (folderColors[""] ?? PALETTE_NEUTRAL[palette])
+            : folderColor(folder, palette, folderColors);
+          const label = folder === "" ? "root" : folder;
+          const weight = Math.min(1, s.n / 15);
+          const size = (11 + weight * 4) / globalScale;
+          ctx.save();
+          ctx.font = `600 ${size}px "Geist", system-ui, sans-serif`;
+          ctx.shadowColor = withAlpha(
+            graphTheme.mode === "light" ? graphTheme.surfaceElevated : graphTheme.bg,
+            graphTheme.mode === "light" ? 0.92 : 0.72,
+          );
+          ctx.shadowBlur = 5 / globalScale;
+          ctx.fillStyle = withAlpha(color, 0.72);
+          ctx.fillText(label, cx, cy);
+          ctx.restore();
+        }
+      }
+    } else if (focusedNodeId) {
+      // Hover-only mode: label only the focused node's cluster.
+      const focused = (nodes as Array<SimNode & { folder?: string; x?: number; y?: number }>)
+        .find((n) => n.id === focusedNodeId);
+      if (focused && globalScale <= 2.0) {
+        const focusedFolder = focused.folder ?? "";
+        let sx = 0, sy = 0, count = 0;
+        for (const n of nodes as Array<SimNode & { x?: number; y?: number; folder?: string }>) {
+          if (n.x == null || n.y == null) continue;
+          if ((n.folder ?? "") !== focusedFolder) continue;
+          sx += n.x; sy += n.y; count += 1;
+        }
+        if (count >= 2) {
+          const cx = sx / count;
+          const cy = sy / count;
+          const color = focusedFolder === ""
+            ? (folderColors[""] ?? PALETTE_NEUTRAL[palette])
+            : folderColor(focusedFolder, palette, folderColors);
+          const label = focusedFolder === "" ? "root" : focusedFolder;
+          const weight = Math.min(1, count / 15);
+          const size = (11 + weight * 4) / globalScale;
+          ctx.save();
+          ctx.font = `600 ${size}px "Geist", system-ui, sans-serif`;
+          ctx.shadowColor = withAlpha(
+            graphTheme.mode === "light" ? graphTheme.surfaceElevated : graphTheme.bg,
+            graphTheme.mode === "light" ? 0.92 : 0.72,
+          );
+          ctx.shadowBlur = 5 / globalScale;
+          ctx.fillStyle = withAlpha(color, 0.85);
+          ctx.fillText(label, cx, cy);
+          ctx.restore();
+        }
+      }
+    }
+
+    // --- Focus pulse ring. Drawn in the same post-frame pass so it
+    // sits on top of nodes + links. Two concentric expanding rings
+    // offset in phase for a sonar-ping feel.
+    if (focusPulse) {
+      const target = (nodes as Array<SimNode & { x?: number; y?: number; degree?: number }>)
+        .find((n) => n.id === focusPulse.nodeId);
+      if (target && target.x != null && target.y != null) {
+        const elapsed = (Date.now() - focusPulse.start) / 1500;
+        if (elapsed >= 0 && elapsed <= 1) {
+          const baseR = snapshotNodeRadius(target, nodes.length, nodeSizeScale);
+          // Ring 1: expands fast, fades out.
+          const r1 = baseR + 4 + elapsed * 60;
+          const a1 = Math.max(0, 0.8 * (1 - elapsed));
+          ctx.save();
+          ctx.strokeStyle = withAlpha(graphTheme.positive, a1);
+          ctx.lineWidth = 2 / globalScale;
+          ctx.beginPath();
+          ctx.arc(target.x, target.y, r1 / globalScale + baseR, 0, Math.PI * 2);
+          ctx.stroke();
+          // Ring 2: offset by 0.3 phase, slower expand.
+          const p2 = Math.max(0, elapsed - 0.3);
+          if (p2 > 0) {
+            const r2 = baseR + 4 + p2 * 50;
+            const a2 = Math.max(0, 0.6 * (1 - p2 / 0.7));
+            ctx.strokeStyle = withAlpha(graphTheme.accent, a2);
+            ctx.lineWidth = 1.5 / globalScale;
+            ctx.beginPath();
+            ctx.arc(target.x, target.y, r2 / globalScale + baseR, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+      }
+    }
+  }, [nodes, focusedNodeId, focusPulse, palette, folderColors, showClusterLabels, graphTheme]);
+
+  /** Community background tints — gated on Analytics mode + the
+   *  "group by community" toggle. Drawn in `onRenderFramePre` so
+   *  every other layer (links, nodes, labels) paints on top.
+   *
+   *  Algorithm (cheap on purpose):
+   *    For each community with ≥3 members, compute the centroid and
+   *    the max distance from centroid to any member. Fill a circle
+   *    of (max-distance + padding) radius at low opacity. Overlapping
+   *    blobs blend additively at low alpha — totally fine visually.
+   *
+   *  No convex hull, no Voronoi, no marching squares. The simpler
+   *  approach reads well at our scale and has zero per-frame
+   *  trigonometry overhead.
+   */
+  const paintBackgroundTints = useCallback((ctx: CanvasRenderingContext2D, globalScale: number) => {
+    // Two ways to show grouping:
+    //  (1) Analytics mode + "group by community" → tint by Louvain
+    //      community (the existing behaviour).
+    //  (2) groupingStyle === "hull" → group by FOLDER (category),
+    //      available outside Analytics too. Renders a convex-hull
+    //      "venn" outline per category with a transparent fill.
+    const communityMode = analyticsMode && analyticsGroupByCommunity && !!analyticsData;
+    const hullMode = groupingStyle === "hull";
+    if (!communityMode && !hullMode) return;
+    if (globalScale > 1.6) return; // Hide once user is reading nodes.
+
+    // Bucket node positions by group key. In community mode the key is
+    // the Louvain community id; in folder/hull mode it's the folder
+    // string. We keep both the points (for geometry) and a representative
+    // colour key per bucket.
+    type Bucket = { pts: Array<{ x: number; y: number }>; folder?: string; degree: number; comId?: number };
+    const buckets = new Map<string, Bucket>();
+    for (const raw of nodes as Array<SimNode & { x?: number; y?: number; folder?: string; degree?: number }>) {
+      if (raw.x == null || raw.y == null) continue;
+      let key: string;
+      let comId: number | undefined;
+      if (communityMode) {
+        const c = analyticsData!.com.get(raw.id);
+        if (c == null) continue;
+        comId = c;
+        key = `c${c}`;
+      } else {
+        key = `f${raw.folder ?? ""}`;
+      }
+      let b = buckets.get(key);
+      if (!b) { b = { pts: [], folder: raw.folder, degree: -1, comId }; buckets.set(key, b); }
+      b.pts.push({ x: raw.x, y: raw.y });
+      // Track the dominant (highest-degree) folder for the tint colour.
+      const d = raw.degree ?? 0;
+      if (d > b.degree) { b.degree = d; b.folder = raw.folder; }
+    }
+
+    for (const [, b] of buckets) {
+      const pts = b.pts;
+      if (pts.length < 3) continue;
+
+      // Tint: cluster-name override (community mode) → folder colour.
+      let tint: string;
+      const clusterName = b.comId != null ? clusterNames[String(b.comId)] : undefined;
+      if (clusterName && clusterColors[clusterName]) {
+        tint = clusterColors[clusterName]!;
+      } else {
+        const colourKey = b.folder ?? (b.comId != null ? `__comm_${b.comId}` : "");
+        tint = folderColor(colourKey, palette, folderColors);
+      }
+
+      if (hullMode) {
+        // Convex hull (monotone chain) + a small outward inflation so the
+        // outline sits clear of the nodes rather than slicing through them.
+        const hull = convexHull(pts);
+        if (hull.length < 3) continue;
+        let sx = 0, sy = 0;
+        for (const p of hull) { sx += p.x; sy += p.y; }
+        const cx = sx / hull.length, cy = sy / hull.length;
+        const inflate = 16;
+        const inflated = hull.map((p) => {
+          const dx = p.x - cx, dy = p.y - cy;
+          const len = Math.hypot(dx, dy) || 1;
+          return { x: p.x + (dx / len) * inflate, y: p.y + (dy / len) * inflate };
+        });
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(inflated[0]!.x, inflated[0]!.y);
+        for (let i = 1; i < inflated.length; i++) ctx.lineTo(inflated[i]!.x, inflated[i]!.y);
+        ctx.closePath();
+        ctx.fillStyle = withAlpha(tint, 0.09);
+        ctx.fill();
+        ctx.lineWidth = 1.5 / globalScale;
+        ctx.strokeStyle = withAlpha(tint, 0.6);
+        ctx.stroke();
+        ctx.restore();
+      } else {
+        // Soft circle blob (community mode default).
+        let sx = 0, sy = 0;
+        for (const p of pts) { sx += p.x; sy += p.y; }
+        const cx = sx / pts.length, cy = sy / pts.length;
+        let maxR = 0;
+        for (const p of pts) {
+          const d = Math.hypot(p.x - cx, p.y - cy);
+          if (d > maxR) maxR = d;
+        }
+        ctx.save();
+        ctx.fillStyle = withAlpha(tint, 0.10);
+        ctx.beginPath();
+        ctx.arc(cx, cy, maxR + 14, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+  }, [analyticsMode, analyticsGroupByCommunity, analyticsData, groupingStyle, nodes, palette, folderColors, clusterColors, clusterNames]);
+
+  // Color accessors shared by 2D + 3D. 3D uses folder color too — so
+  // orbiting the scene, you see folders as clearly-colored clouds of
+  // nodes rather than a monochromatic swarm.
+  const nodeColor = useCallback((rawNode: unknown) => {
+    const n = rawNode as SimNode & { communityId?: number | null };
+    const folder = n.folder ?? "";
+    if (folderColors[folder]) return folderColors[folder]!;
+    if (n.communityId != null) {
+      const colors = PALETTES[palette];
+      return colors[Math.abs(n.communityId) % colors.length]!;
+    }
+    return folderColor(folder, palette, folderColors);
+  }, [palette, folderColors]);
+  const nodeVal = useCallback((rawNode: unknown) => {
+    const n = rawNode as SimNode & { degree?: number; labelRank?: number };
+    const anchor = (n.labelRank ?? Number.POSITIVE_INFINITY) < 8;
+    return anchor ? 3.4 : Math.min(2.6, 0.75 + Math.sqrt(Math.max(0, n.degree ?? 0)) * 0.22);
+  }, []);
+
+  // Persistent 3D labels. Sprite textures are GPU resources with no finalizer,
+  // so the cache is disposed on unmount and whenever the label colour changes.
+  const labelSpriteCacheRef = useRef(new LabelSpriteCache());
+  useEffect(() => {
+    const cache = labelSpriteCacheRef.current;
+    return () => cache.dispose();
+  }, []);
+  useEffect(() => {
+    // Theme switch: every cached sprite is rasterised in the old colour.
+    labelSpriteCacheRef.current.dispose();
+  }, [graphTheme.text]);
+
+  const label3DFor = useCallback((rawNode: unknown) => {
+    if (labelMode === "off") return undefined;
+    const n = rawNode as SimNode & { labelRank?: number };
+    // Key = community anchors only, exactly as the 2D painter defines it.
+    // (2D additionally gates All behind zoom >= 1.2; 3D has no globalScale
+    // equivalent, so All means all.)
+    if (labelMode === "key" && !isKeyLabelNode(n.labelRank, snapshotModel.nodes.length)) {
+      return undefined;
+    }
+    const sprite = labelSpriteCacheRef.current.get(labelText(n.title), graphTheme.text);
+    if (!sprite) return undefined;
+    // One Sprite instance cannot sit at two positions in a scene graph, and the
+    // cache dedupes by text -- clone so notes sharing a title both get a label.
+    const instance = sprite.clone();
+    instance.position.set(0, 4.5, 0);
+    return instance;
+  }, [labelMode, graphTheme.text, snapshotModel.nodes.length]);
+  // Precompute edgeConfidence per edge once (it depends only on the edge
+  // fields + the bidi set). The per-frame linkColor / linkWidth callbacks
+  // then do a Map lookup instead of recomputing confidence for thousands of
+  // edges every frame — the dominant per-frame cost when edges are shown.
+  // Falls back to a live compute if a key is somehow missing.
+  const edgeConfByKey = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const e of rawEdges as GraphEdge[]) {
+      m.set(
+        `${e.from}|${e.to}|${e.link_type}`,
+        edgeConfidence(
+          { from: e.from, to: e.to, similarity: e.similarity, link_type: e.link_type },
+          { bidi: graphData.bidi },
+        ),
+      );
+    }
+    return m;
+  }, [rawEdges, graphData.bidi]);
+
+  const linkColor = useCallback((rawLink: unknown) => {
+    const l = rawLink as {
+      from?: string;
+      to?: string;
+      similarity: number;
+      link_type: string;
+      source: string | { id: string };
+      target: string | { id: string };
+    };
+    // Driven by `edgeConfidence` (semantic + link kind + reciprocity)
+    // not raw similarity. A manual wikilink at sim 0.5 now reads
+    // bolder than an unknown semantic at sim 0.7 — honest fidelity
+    // for what the relationship actually is.
+    const fromId = typeof l.source === "string" ? l.source : l.source.id;
+    const toId = typeof l.target === "string" ? l.target : l.target.id;
+    const conf =
+      edgeConfByKey.get(`${l.from ?? fromId}|${l.to ?? toId}|${l.link_type}`) ??
+      edgeConfidence(
+        { from: l.from ?? fromId, to: l.to ?? toId, similarity: l.similarity, link_type: l.link_type },
+        { bidi: graphData.bidi },
+      );
+    const baseAlpha = Math.max(0.025, Math.min(0.14, conf * 0.13));
+    // Dim non-neighbourhood edges when hover-focus is on. (react-force-
+    // graph mutates source/target into node objects once the simulation
+    // starts, hence the union type.)
+    if (focusedNodeId) {
+      const touchesFocus = fromId === focusedNodeId || toId === focusedNodeId;
+      const a = touchesFocus ? Math.min(0.92, baseAlpha * 2.2) : 0.04;
+      return edgeColor(l.link_type, a);
+    }
+    return edgeColor(l.link_type, baseAlpha);
+  }, [focusedNodeId, graphData.bidi, edgeConfByKey]);
+  const linkWidth = useCallback((rawLink: unknown) => {
+    const l = rawLink as {
+      from?: string;
+      to?: string;
+      similarity: number;
+      link_type: string;
+      source: string | { id: string };
+      target: string | { id: string };
+    };
+    const fromId = typeof l.source === "string" ? l.source : l.source.id;
+    const toId = typeof l.target === "string" ? l.target : l.target.id;
+    // Time-lapse: an edge is visible only when BOTH endpoints have
+    // appeared yet. Returning 0 width hides it without disturbing
+    // the simulation; the link force still applies.
+    if (!isNodeVisibleAtTl(fromId) || !isNodeVisibleAtTl(toId)) return 0;
+    // Search dim: edges that touch a non-matching node go thin.
+    const searchOk =
+      !searchMatches || (searchMatches.has(fromId) && searchMatches.has(toId));
+    const conf =
+      edgeConfByKey.get(`${l.from ?? fromId}|${l.to ?? toId}|${l.link_type}`) ??
+      edgeConfidence(
+        { from: l.from ?? fromId, to: l.to ?? toId, similarity: l.similarity, link_type: l.link_type },
+        { bidi: graphData.bidi },
+      );
+    const base = (0.1 + conf * 0.28) * linkThicknessScale * (searchOk ? 1 : 0.22);
+    if (focusedNodeId) {
+      if (fromId === focusedNodeId || toId === focusedNodeId) return base * 2.4;
+    }
+    return base;
+  }, [focusedNodeId, graphData.bidi, linkThicknessScale, isNodeVisibleAtTl, searchMatches, edgeConfByKey]);
+  // Bidirectional edge curvature: when both A→B and B→A exist, curve
+  // them in opposite directions so they no longer draw on top of each
+  // other. Each direction gets ±0.15 curvature — subtle enough not
+  // to distort layout but enough to visually separate the pair.
+  const linkCurvature = useCallback((rawLink: unknown) => {
+    const l = rawLink as {
+      source: string | { id: string };
+      target: string | { id: string };
+    };
+    const from = typeof l.source === "string" ? l.source : l.source.id;
+    const to = typeof l.target === "string" ? l.target : l.target.id;
+    const [a, b] = from < to ? [from, to] : [to, from];
+    if (!graphData.bidi.has(`${a}|${b}`)) return 0;
+    // A→B curves +0.15, B→A curves -0.15. Use the canonical order.
+    return from === a ? 0.15 : -0.15;
+  }, [graphData.bidi]);
+
+  // Legend rows for the edges, derived from the painter that is actually on
+  // screen: the force-graph snapshots colour by `edgeColor`, the Atlas
+  // compositions by `edgeThemeColor`. Passing the paint function itself (rather
+  // than restating the palette in the legend) is what stops a row from
+  // outliving its encoding — including the cases where two link types honestly
+  // share one colour, which `buildEdgeLegendRows` folds into a single row.
+  const edgeLegendRows = useMemo<EdgeLegendRow[]>(() => {
+    if (mode === "engine") {
+      const atlas = atlasEdgeTheme(graphTheme);
+      return buildEdgeLegendRows(edges, (type) => edgeThemeColor(type, atlas), {
+        inheritColor: atlas.dim,
+      });
+    }
+    // 0.95 keeps the swatch readable; the painter's own alpha carries per-edge
+    // confidence, which `edgeIntensityLabel` decodes on its own row.
+    return buildEdgeLegendRows(edges, (type) => edgeColor(type, 0.95));
+  }, [edges, mode, graphTheme]);
+
+  // Confidence reads differently per renderer: 2D scales width AND alpha, 3D
+  // draws fixed-width lines so only alpha moves, Atlas fixes the blend and
+  // scales width. Claim only what the active one does.
+  const edgeIntensityLabel =
+    mode === "engine"
+      ? "Thicker = higher confidence"
+      : mode === "3d"
+        ? "Brighter = higher confidence"
+        : "Thicker + brighter = higher confidence";
+
+  // Edge-type labels (the "manual" / "semantic" / "uses" / etc.
+  // pills) were REMOVED in the aesthetic pass. Even at zoom ≥1.6×
+  // they produced wall-of-text — a 200-edge subgraph means 200
+  // pills. The hover tooltip (`linkLabel`) surfaces the same info
+  // on demand without polluting the static canvas.
+
+  return (
+    <div
+      ref={containerRef}
+      className="flex-1 relative overflow-hidden"
+      style={{ background: "var(--nv-bg)" }}
+      onMouseMove={handleContainerMouseMove}
+      onMouseLeave={() => scheduleClose()}
+    >
+      {/* ONE toolbar. There used to be two — this branched on mode === "engine"
+          and swapped in a different set of controls, so Fit lived in both, image
+          export lived in both under different labels ("Save image" vs "Save PNG
+          image"), and Filters existed only inside the Engine. Every view is a
+          preset now, so every view gets the same controls. */}
+      <div className="absolute top-4 right-4 z-30 flex items-center gap-1 rounded-xl p-1 font-[Geist,sans-serif]"
+        style={{ background: "var(--nv-surface)", border: "1px solid var(--nv-border)", boxShadow: "0 12px 34px rgba(0,0,0,0.22)" }}>
+        <GraphPresetBar preset={preset} onSelect={setPreset} />
+        <label className="flex items-center gap-1 px-1.5 text-[10px]" style={{ color: "var(--nv-text-dim)" }}>
+          Names
+          <select value={labelMode} onChange={(event) => setLabelMode(event.target.value as GraphLabelMode)} className="bg-transparent text-[10px] outline-none" style={{ color: "var(--nv-text-muted)" }} aria-label="Note names">
+            <option value="off">Off</option>
+            <option value="key">Key</option>
+            <option value="all">All</option>
+          </select>
+        </label>
+        <label className="flex items-center gap-1 px-1.5 text-[10px]" style={{ color: "var(--nv-text-dim)" }}>
+          Lines
+          <select value={connectionMode} onChange={(event) => setConnectionMode(event.target.value as GraphConnectionMode)} className="bg-transparent text-[10px] outline-none" style={{ color: "var(--nv-text-muted)" }} aria-label="Connections">
+            <option value="off">Off</option>
+            <option value="featured">Some</option>
+            <option value="all">All</option>
+          </select>
+        </label>
+        <button onClick={handleZoomFit} className="rounded-lg px-2 py-1 text-[10px] font-medium uppercase tracking-wider" style={{ color: "var(--nv-text-muted)" }}>
+          Fit
+        </button>
+        <details className="relative">
+          <summary className="cursor-pointer list-none rounded-lg px-2 py-1 text-[12px] [&::-webkit-details-marker]:hidden" style={{ color: "var(--nv-text-muted)" }} aria-label="More graph actions">
+            •••
+          </summary>
+          <div className="absolute right-0 mt-2 grid min-w-[150px] gap-0.5 rounded-xl p-1.5"
+            style={{ background: "var(--nv-surface)", border: "1px solid var(--nv-border)", boxShadow: "0 18px 42px rgba(0,0,0,0.35)" }}>
+            <button onClick={() => setFilterPanelOpen((open) => !open)} className="rounded-lg px-2 py-1.5 text-left text-[10px]" style={{ color: filterPanelOpen ? "var(--nv-accent)" : "var(--nv-text-muted)" }} aria-pressed={filterPanelOpen}>
+              Filters
+            </button>
+            <button onClick={handleRefresh} disabled={refreshing} className="rounded-lg px-2 py-1.5 text-left text-[10px]" style={{ color: "var(--nv-text-muted)" }}>
+              {refreshing ? "Updating…" : "Update snapshot"}
+            </button>
+            <button onClick={() => setDiagnosticOpen(true)} className="rounded-lg px-2 py-1.5 text-left text-[10px]" style={{ color: "var(--nv-text-muted)" }}>
+              Vault diagnostic
+            </button>
+            <button onClick={toggleAnalyticsMode} className="rounded-lg px-2 py-1.5 text-left text-[10px]" style={{ color: analyticsMode ? "var(--nv-accent)" : "var(--nv-text-muted)" }}>
+              {analyticsMode ? "Hide analytics" : "Show analytics"}
+            </button>
+            <button onClick={handleSaveImage} className="rounded-lg px-2 py-1.5 text-left text-[10px]" style={{ color: "var(--nv-text-muted)" }}>
+              Save PNG image
+            </button>
+            <button onClick={handleCopyImage} className="rounded-lg px-2 py-1.5 text-left text-[10px]" style={{ color: "var(--nv-text-muted)" }}>
+              Copy image
+            </button>
+          </div>
+        </details>
+      </div>
+
+      {/* Analytics tip bar — appears below the toolbar when analytics
+          mode is on. Idle copy + per-hover swap + dismiss-for-session. */}
+      <AnalyticsTipBar visible={analyticsMode} hoverText={tipBarHoverText} />
+      <GraphLegend
+        visible={analyticsMode}
+        clusters={legendClusters}
+        edges={edgeLegendRows}
+        edgeIntensityLabel={edgeIntensityLabel}
+        onFocusCluster={handleFocusCluster}
+      />
+      <BrainDiagnostic
+        open={diagnosticOpen}
+        onClose={() => setDiagnosticOpen(false)}
+        nodes={nodes}
+        edges={rawEdges}
+        brainName={brainName}
+        brainId={activeBrainId ?? undefined}
+      />
+
+      {/* Filters / Display / Time-lapse panel — opens from the ••• menu.
+          Reads + writes the graph settings store, which the render paths
+          above subscribe to.
+
+          No longer gated on the Engine. It used to mount only when
+          mode === "engine", which was fine while Filters lived exclusively in
+          the Engine's own toolbar. Now that every preset shares one ••• menu,
+          that gate would have made the Filters button do nothing in 2D and 3D
+          — and every control inside it (orphans, semantic edges, node size,
+          search) applies to the snapshots just as much. */}
+      <GraphFilterPanel
+        open={filterPanelOpen}
+        onClose={() => setFilterPanelOpen(false)}
+        nodeCount={nodes.length}
+        orphanCount={nodes.filter((n) => (graphData.adjacency.get(n.id)?.size ?? 0) === 0).length}
+        semanticEdgeCount={semanticEdgeCount}
+        codeNodeCount={codeIds.size}
+        onTimelapseStart={startTimelapse}
+        onTimelapseStop={stopTimelapse}
+        timelapseActive={tlActive}
+      />
+
+      {atlasFallbackNotice && (
+        <div
+          className="absolute top-14 right-4 z-20 flex items-center gap-2 rounded-lg px-3 py-2 text-[11px] font-[Geist,sans-serif]"
+          style={{
+            background: "var(--nv-surface)",
+            border: "1px solid var(--nv-border)",
+            color: "var(--nv-text-muted)",
+          }}
+          role="status"
+        >
+          <span>{atlasFallbackNotice}</span>
+          <button
+            type="button"
+            onClick={() => setAtlasFallbackNotice(null)}
+            aria-label="Dismiss Graph Engine fallback message"
+            style={{ color: "var(--nv-text-dim)" }}
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      <Suspense fallback={
+        <div className="absolute inset-0 flex items-center justify-center">
+          <p className="text-sm font-[Geist,sans-serif]" style={{ color: "var(--nv-text-dim)" }}>
+            Loading graph engine…
+          </p>
+        </div>
+      }>
+        {mode === "engine" ? (
+          <AtlasGraph
+            ref={atlasRef}
+            brainId={activeBrainId ?? "default"}
+            nodes={nodes}
+            model={snapshotModel}
+            palette={palette}
+            folderColors={folderColors}
+            nodeSizeScale={nodeSizeScale}
+            linkThicknessScale={linkThicknessScale}
+            lite={lite}
+            searchMatches={searchMatches}
+            visibleNodeIds={atlasVisibleNodeIds}
+            showOrphans={showOrphans}
+            onNodeHover={handleNodeHover}
+            onNodeClick={handleNodeClick}
+            onRuntimeError={handleAtlasRuntimeError}
+            // Controlled: the preset IS the composition. AtlasGraph used to own
+            // this in its own localStorage key, which is why the two could
+            // disagree about what was on screen.
+            patternId={preset as AtlasPatternId}
+          />
+        ) : mode !== "3d" ? (
+          <ForceGraph2D
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            ref={fg2dRef as any}
+            graphData={snapshot2DData}
+            width={size.w}
+            height={size.h}
+            backgroundColor="rgba(0,0,0,0)"
+            nodeLabel=""
+            nodeRelSize={5}
+            nodeVal={nodeVal}
+            nodeColor={nodeColor}
+            nodeCanvasObject={paintNode2D}
+            nodeCanvasObjectMode={() => "replace"}
+            nodePointerAreaPaint={paintPointerArea2D}
+            // Bind through `from`/`to`, not the default `source`/`target`. The
+            // library does `link.source = link[linkSource]` on every data bind:
+            // with the default that is a self-assign no-op once d3 has replaced
+            // the id string with a node object, so a link can never be rebound
+            // to a different graph's nodes. `from`/`to` are never mutated, so
+            // this restores the id each bind and lets d3 re-resolve correctly.
+            linkSource="from"
+            linkTarget="to"
+            linkLabel={linkLabel}
+            linkColor={linkColor}
+            linkWidth={linkWidth}
+            linkCurvature={linkCurvature}
+            linkDirectionalParticles={0}
+            linkDirectionalArrowLength={showArrows ? 3.5 : 0}
+            linkDirectionalArrowRelPos={0.92}
+            onRenderFramePre={lite ? undefined : paintBackgroundTints}
+            onRenderFramePost={lite ? undefined : paintClusterLabels}
+            cooldownTicks={0}
+            cooldownTime={0}
+            warmupTicks={0}
+            onNodeHover={handleNodeHover}
+            onNodeClick={handleNodeClick}
+            enableNodeDrag={false}
+            enableZoomInteraction={true}
+            enablePanInteraction={true}
+            minZoom={0.05}
+            maxZoom={50}
+          />
+        ) : (
+          <ForceGraph3D
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            ref={fg3dRef as any}
+            graphData={snapshot3DData}
+            width={size.w}
+            height={size.h}
+            backgroundColor={graphTheme.bg}
+            rendererConfig={INTERACTIVE_WEBGL_RENDERER_CONFIG}
+            nodeLabel={labelMode === "off" ? "" : (n: unknown) => (n as SimNode).title}
+            // Persistent labels. `nodeLabel` above is only a hover tooltip, so
+            // Key and All used to be identical props and All showed nothing
+            // until you hovered. Extend (not replace) so the default sphere
+            // still renders underneath the sprite.
+            // three-forcegraph's runtime contract accepts a falsy return
+            // ("use the default node object"), but its typings insist on
+            // Object3D. Cast at the boundary rather than allocate an empty
+            // Object3D for every unlabelled note.
+            nodeThreeObject={label3DFor as unknown as (node: object) => Object3D}
+            nodeThreeObjectExtend={true}
+            nodeRelSize={2.5}
+            nodeVal={nodeVal}
+            nodeColor={nodeColor}
+            nodeOpacity={0.9}
+            // See the 2D comment: bind through the never-mutated `from`/`to`.
+            linkSource="from"
+            linkTarget="to"
+            linkLabel={linkLabel}
+            linkColor={linkColor}
+            // 0 renders THREE.Line (a crisp 1px line) instead of a cylinder.
+            // linkWidth returns ~0.24-0.38, which three-forcegraph treats as a
+            // cylinder of WORLD radius ~0.12-0.19 inside a 90-220 unit scene --
+            // i.e. sub-pixel. Lines are also far cheaper across thousands of
+            // edges; confidence stays encoded in linkColor's alpha.
+            linkWidth={0}
+            linkCurvature={linkCurvature}
+            // 1, not 0.38: three-forcegraph computes
+            // `opacity = linkOpacity * colorAlpha(color)`, and linkColor already
+            // bakes in alpha (0.065-0.117). Multiplying by 0.38 gave an
+            // effective 2.5-4.4% -- invisible. 2D applies that alpha exactly
+            // once, which is why only 3D looked broken.
+            linkOpacity={1}
+            linkDirectionalParticles={0}
+            onNodeHover={handleNodeHover}
+            onNodeClick={handleNodeClick}
+            enableNodeDrag={false}
+            cooldownTicks={0}
+            cooldownTime={0}
+            warmupTicks={0}
+            showNavInfo={false}
+          />
+        )}
+      </Suspense>
+
+      {/* Hover preview card — positioned near the cursor */}
+      {hoverCard && (
+        <div
+          className="absolute rounded-lg shadow-2xl p-4 w-[260px] pointer-events-auto z-10"
+          style={{
+            left: hoverCard.screenX,
+            top: hoverCard.screenY,
+            background: "var(--nv-bg)",
+            border: "1px solid var(--nv-border)",
+          }}
+          onMouseEnter={cancelClose}
+          onMouseLeave={() => scheduleClose()}
+        >
+          <div className="flex items-start justify-between gap-2 mb-2">
+            <h3 className="text-sm font-semibold font-[Geist,sans-serif] leading-tight" style={{ color: "var(--nv-text)" }}>
+              {hoverCard.node.title}
+            </h3>
+            <span
+              className={`text-[9px] font-[Geist,sans-serif] px-1.5 py-0.5 rounded flex-shrink-0 ${
+                hoverCard.node.state === "active" || hoverCard.node.state === "fresh"
+                  ? "bg-[#568cfa]/15 text-[#568cfa]"
+                  : hoverCard.node.state === "connected"
+                    ? "bg-[#00c9b1]/15 text-[#00c9b1]"
+                    : "[background-color:var(--nv-surface)] [color:var(--nv-text-muted)]"
+              }`}
+            >
+              {Math.round(hoverCard.node.strength * 100)}%
+            </span>
+          </div>
+
+          {hoverCard.preview && (
+            <p className="text-xs line-clamp-4 mb-3 font-[Geist,sans-serif] leading-relaxed" style={{ color: "var(--nv-text-muted)" }}>
+              {hoverCard.preview}
+            </p>
+          )}
+
+          <div className="flex items-center justify-between text-[10px] font-[Geist,sans-serif] mb-3" style={{ color: "var(--nv-text-dim)" }}>
+            <span>{hoverCard.node.access_count} accesses</span>
+            <span className="capitalize">{hoverCard.node.state}</span>
+          </div>
+
+          <button
+            onClick={() => handleViewNote(hoverCard.node)}
+            className="w-full text-xs font-medium font-[Geist,sans-serif] py-1.5 rounded hover:brightness-110 transition-all"
+            style={{ background: "var(--nv-accent)", color: "var(--nv-bg)" }}
+          >
+            View note
+          </button>
+        </div>
+      )}
+
+      {mode !== "engine" && (
+        <div
+          className="absolute bottom-4 right-4 pointer-events-none text-[10px] font-[Geist,sans-serif] tabular-nums"
+          style={{ color: "var(--nv-text-dim)" }}
+        >
+          Fixed {mode.toUpperCase()} snapshot · {nodes.length.toLocaleString()} memories
+        </div>
+      )}
+
+      {nodes.length === 0 && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center p-6">
+          <div
+            className="max-w-sm rounded-2xl p-6 text-center font-[Geist,sans-serif]"
+            style={{ background: "var(--nv-surface)", border: "1px solid var(--nv-border)" }}
+          >
+            <h2 className="text-base font-semibold" style={{ color: "var(--nv-text)" }}>Your graph will grow here</h2>
+            <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--nv-text-muted)" }}>
+              Create or import Markdown notes, then NeuroVault will update this snapshot when their connections change.
+            </p>
+            <div className="mt-5 flex justify-center gap-2">
+              <button
+                type="button"
+                onClick={async () => { await createNote("Untitled"); onOpenNote?.(); }}
+                className="rounded-lg px-4 py-2 text-xs font-semibold"
+                style={{ background: "var(--nv-accent)", color: "var(--nv-bg)" }}
+              >
+                Create a note
+              </button>
+              <button
+                type="button"
+                onClick={handleRefresh}
+                disabled={refreshing}
+                className="rounded-lg px-4 py-2 text-xs font-medium"
+                style={{ border: "1px solid var(--nv-border)", color: "var(--nv-text-muted)" }}
+              >
+                {refreshing ? "Updating…" : "Check again"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

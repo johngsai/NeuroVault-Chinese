@@ -1,0 +1,22 @@
+{
+  "name": "@neurovault/mcp-darwin-arm64",
+  "version": "0.6.0",
+  "description": "NeuroVault headless MCP server \u2014 prebuilt binary for macOS Apple Silicon (arm64).",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin/neurovault-server",
+    "bin/vec0.dylib"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sirdath/NeuroVault.git",
+    "directory": "dist-npm/packages/mcp-darwin-arm64"
+  },
+  "homepage": "https://github.com/sirdath/NeuroVault#readme"
+}

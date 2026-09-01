@@ -1,0 +1,167 @@
+name: npm-release
+
+# Publish the headless NeuroVault MCP server to npm as `@neurovault/mcp` plus
+# its per-platform binary subpackages: macOS (arm64 + x64), Linux x64 (glibc),
+# and Windows x64. The headless binary is built with --no-default-features so it
+# links no Tauri (no WebKit/GTK/WebView2), and fastembed uses rustls so it needs
+# no OpenSSL — verified per-runner below.
+#
+# Trigger by pushing a tag like `npm-v0.5.2`. Requires repo secret NPM_TOKEN.
+on:
+  push:
+    tags: ['npm-v*']
+  workflow_dispatch:
+  # Build + per-platform smoke (incl. Windows) on a PR into main, so the
+  # headless distribution is verified BEFORE merge. Publish stays tag-only.
+  pull_request:
+    branches: [main]
+    paths:
+      - 'dist-npm/**'
+      - 'scripts/build-headless.mjs'
+      - 'src-tauri/**'
+      - '.github/workflows/npm-release.yml'
+
+jobs:
+  build:
+    name: build ${{ matrix.triple }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            triple: aarch64-apple-darwin
+            subpkg: mcp-darwin-arm64
+            binfile: neurovault-server
+            link_tool: otool -L
+            forbidden: 'WebKit|AppKit|Carbon|OSAKit|GTK|libonnxruntime'
+            ort_cache: ~/Library/Caches/ort.pyke.io
+          # NOTE: no Intel-Mac (macos-13 / x86_64) job. It never once
+          # produced an artifact — the job sat in GitHub's Intel-runner queue
+          # for ~24h and was cancelled by the timeout on every run. release.yml
+          # and release-vscode.yml already dropped theirs for the same reason.
+          #
+          # It would also have shipped broken: build-headless.mjs maps both mac
+          # triples to the same arm64-only vec0.dylib, and sqlite_vec::load is
+          # fatal in db.rs::open_new, so every brain open would fail. Re-adding
+          # this needs BOTH a reliable Intel runner and an x64 vec0.
+          - os: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+            subpkg: mcp-linux-x64
+            binfile: neurovault-server
+            link_tool: ldd
+            forbidden: 'webkit|libssl|libcrypto|libonnxruntime'
+            ort_cache: ~/.cache/ort.pyke.io
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            subpkg: mcp-win32-x64
+            binfile: neurovault-server.exe
+            # No otool/ldd on Windows + vec0.dll is committed; the --help smoke
+            # (binary loads + runs) is the dependency-resolution proof here.
+            link_tool: ''
+            forbidden: ''
+            ort_cache: ~/AppData/Local/ort.pyke.io
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: ${{ matrix.triple }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+      # Linux ships no committed vec0 — fetch the matching loadable extension
+      # (vec0.so) from the same sqlite-vec release the desktop app pins. macOS
+      # uses the committed src-tauri/resources/vec0.dylib.
+      - name: Download vec0.so (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="v0.1.9"; STRIPPED="${VERSION#v}"
+          ASSET="sqlite-vec-${STRIPPED}-loadable-linux-x86_64.tar.gz"
+          curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o /tmp/vec.tgz \
+            "https://github.com/asg017/sqlite-vec/releases/download/${VERSION}/${ASSET}"
+          mkdir -p src-tauri/resources
+          tar -xzf /tmp/vec.tgz -C src-tauri/resources/
+          ls -lh src-tauri/resources/vec0.so
+      # Cache the ort static-onnxruntime download to de-flake the build.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ matrix.ort_cache }}
+          key: ort-${{ matrix.triple }}
+      - name: Build + stage headless binary
+        run: node scripts/build-headless.mjs ${{ matrix.triple }}
+      - name: Sanity — no GUI / OpenSSL / dynamic-onnx leaked in
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          BIN="dist-npm/packages/${{ matrix.subpkg }}/bin/${{ matrix.binfile }}"
+          ${{ matrix.link_tool }} "$BIN" | tee /tmp/links
+          if grep -qiE '${{ matrix.forbidden }}' /tmp/links; then
+            echo "::error::forbidden dynamic dependency leaked into the headless binary"; exit 1
+          fi
+      # Real smoke (all platforms, incl. Windows via git-bash): the binary not
+      # only links but starts as a server, serves HTTP, and LOADS vec0 by opening
+      # a brain DB — the path that --help never touches. No model download
+      # (the embedder is lazy; opening a brain doesn't embed).
+      - name: Smoke — server starts, serves, loads vec0
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="dist-npm/packages/${{ matrix.subpkg }}/bin/${{ matrix.binfile }}"
+          "$BIN" --help >/dev/null
+          "$BIN" --port 8799 &
+          SRV=$!
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8799/api/version >/dev/null 2>&1 && break || sleep 1; done
+          curl -fsS http://127.0.0.1:8799/api/version | grep -q '"version"'
+          # Create a brain + read its stats → opens brain.db → load_extension(vec0).
+          curl -fsS -X POST http://127.0.0.1:8799/api/brains -H 'content-type: application/json' -d '{"name":"smoke"}' >/dev/null
+          curl -fsS http://127.0.0.1:8799/api/brains/smoke/stats | grep -q '"brain_id"'
+          kill "$SRV" 2>/dev/null || true
+          echo "✓ ${{ matrix.triple }}: server + vec0 load OK"
+      - name: Pack subpackage
+        # `npm pack --pack-destination` does NOT create the directory; it exits
+        # with ENOENT. Every matrix build reached this step after a passing
+        # smoke test and then died before uploading its tarball, so the publish
+        # job could never receive a complete set. Reproduced in a temp dir.
+        run: |
+          mkdir -p ./artifacts
+          npm pack "./dist-npm/packages/${{ matrix.subpkg }}" --pack-destination ./artifacts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.subpkg }}
+          path: artifacts/*.tgz
+
+  publish:
+    name: publish to npm
+    needs: build
+    # Only publish on a real `npm-v*` tag. A manual `workflow_dispatch` run does
+    # the build + per-platform smokes ONLY — so you can dry-run the Windows
+    # build with no npm token, then tag when it's green.
+    if: startsWith(github.ref, 'refs/tags/npm-v')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # npm --provenance
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+      # Subpackages MUST publish before the root — the root's optionalDependencies
+      # pin them at the same exact version and npm resolves them at install time.
+      - name: Publish platform subpackages
+        run: |
+          for tgz in artifacts/*/*.tgz; do
+            echo "publishing $tgz"
+            npm publish "$tgz" --access public --provenance
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish root @neurovault/mcp
+        run: npm publish ./dist-npm --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

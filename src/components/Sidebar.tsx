@@ -1,0 +1,1055 @@
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { useNoteStore } from "../stores/noteStore";
+import { useBrainStore } from "../stores/brainStore";
+import {
+  brainUiScope,
+  mergeScopedPreviews,
+  previewsForScope,
+  scopedStorageKey,
+  type ScopedPreviewCache,
+} from "../lib/brainScopedUiState";
+import { relativeTime, extractPreview } from "../lib/utils";
+import { readNote } from "../lib/tauri";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { ContextMenu, type ContextMenuEntry } from "./ContextMenu";
+import { useGraphSettingsStore, folderColor } from "../stores/graphSettingsStore";
+import { useSettingsStore } from "../stores/settingsStore";
+import type { NoteMeta } from "../lib/tauri";
+
+/** Top-level folder of a note (first path segment before "/"), or ""
+ *  for a root-level note. Mirrors the graph's folder derivation so a
+ *  note shows the same category colour in both the tree and the graph. */
+function noteFolder(filename: string): string {
+  const slash = filename.indexOf("/");
+  return slash > 0 ? filename.slice(0, slash) : "";
+}
+
+
+// Virtualized row estimate. Rows with previews run ~72px, without ~48px.
+// The virtualizer uses this as a bootstrap and then refines per-row once
+// each row is measured via measureElement.
+const ESTIMATED_ROW_HEIGHT = 68;
+const ESTIMATED_ROW_HEIGHT_WITHOUT_PREVIEW = 48;
+const VIRTUAL_OVERSCAN = 6;
+const PREVIEW_READ_CONCURRENCY = 4;
+const MIN_SIDEBAR_WIDTH = 220;
+const MAX_SIDEBAR_WIDTH = 420;
+const DEFAULT_SIDEBAR_WIDTH = 248;
+
+interface PreviewTarget {
+  scope: string;
+  filename: string;
+}
+
+function previewTargetKey(scope: string, filename: string): string {
+  return `${scope}\u0000${filename}`;
+}
+
+/** Convert a viewport pointer coordinate into a width local to the note
+ * browser. The global navigation rail sits to its left, so using clientX
+ * directly makes the browser jump wider by the rail width. */
+export function sidebarWidthFromPointer(clientX: number, sidebarLeft: number): number {
+  return Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, clientX - sidebarLeft));
+}
+
+
+interface SidebarProps {
+  triggerNewNote?: number;
+  triggerSearch?: number;
+  onNoteSelect?: () => void;
+  onTrashOpen?: () => void;
+}
+
+export function Sidebar(props: SidebarProps = {}) {
+  const brainId = useBrainStore((state) => state.activeBrainId);
+  const vaultPath = useNoteStore((state) => state.vaultPath);
+  const scope = brainUiScope(brainId, vaultPath);
+  return <BrainSidebar key={scope} scope={scope} brainId={brainId} {...props} />;
+}
+
+function BrainSidebar({
+  scope,
+  brainId,
+  triggerNewNote = 0,
+  triggerSearch = 0,
+  onNoteSelect,
+  onTrashOpen,
+}: SidebarProps & { scope: string; brainId: string | null }) {
+  const notes = useNoteStore((s) => s.notes);
+  const notesStatus = useNoteStore((s) => s.notesStatus);
+  const notesError = useNoteStore((s) => s.notesError);
+  const loadNotes = useNoteStore((s) => s.loadNotes);
+  const activeFilename = useNoteStore((s) => s.activeFilename);
+  const searchQuery = useNoteStore((s) => s.searchQuery);
+  const setSearchQuery = useNoteStore((s) => s.setSearchQuery);
+  const _selectNote = useNoteStore((s) => s.selectNote);
+
+  // When a note is clicked, select it AND switch to editor view
+  const selectNote = useCallback(
+    async (filename: string) => {
+      if (await _selectNote(filename)) onNoteSelect?.();
+    },
+    [_selectNote, onNoteSelect]
+  );
+  const createNote = useNoteStore((s) => s.createNote);
+  const deleteNoteAction = useNoteStore((s) => s.deleteNote);
+  const renameNoteAction = useNoteStore((s) => s.renameNote);
+
+  // Inline rename — populated with the note's current filename when the
+  // user clicks the pencil icon on a row. The corresponding row renders
+  // an input instead of the title. Enter commits; Esc cancels.
+  const [renamingFilename, setRenamingFilename] = useState<string | null>(null);
+
+  const showPreviewSnippets = useSettingsStore((s) => s.showPreviewSnippets);
+  const [previewCache, setPreviewCache] = useState<ScopedPreviewCache>({});
+  const previews = previewsForScope(previewCache, scope);
+  const previewCacheRef = useRef(previewCache);
+  const previewQueueRef = useRef<PreviewTarget[]>([]);
+  const previewPendingKeysRef = useRef(new Set<string>());
+  const previewActiveReadsRef = useRef(0);
+  const previewMountedRef = useRef(true);
+  const previewEnabledRef = useRef(showPreviewSnippets);
+  const previewScopeRef = useRef(scope);
+  const [isCreating, setIsCreating] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => { previewCacheRef.current = previewCache; }, [previewCache]);
+
+  const pumpPreviewQueue = useCallback(function drainPreviewQueue() {
+    if (!previewMountedRef.current || !previewEnabledRef.current) return;
+
+    while (
+      previewActiveReadsRef.current < PREVIEW_READ_CONCURRENCY &&
+      previewQueueRef.current.length > 0
+    ) {
+      const target = previewQueueRef.current.shift();
+      if (!target) break;
+      const key = previewTargetKey(target.scope, target.filename);
+      previewActiveReadsRef.current += 1;
+
+      void readNote(target.filename, brainId)
+        .then((content) => extractPreview(content), () => "")
+        .then((preview) => {
+          if (
+            !previewMountedRef.current ||
+            !previewEnabledRef.current ||
+            previewScopeRef.current !== target.scope
+          ) return;
+
+          setPreviewCache((cache) => {
+            const scoped = previewsForScope(cache, target.scope);
+            if (Object.prototype.hasOwnProperty.call(scoped, target.filename)) return cache;
+            const next = mergeScopedPreviews(cache, target.scope, {
+              [target.filename]: preview,
+            });
+            // Keep scheduling decisions current before React's next render.
+            previewCacheRef.current = next;
+            return next;
+          });
+        })
+        .finally(() => {
+          previewActiveReadsRef.current -= 1;
+          previewPendingKeysRef.current.delete(key);
+          drainPreviewQueue();
+        });
+    }
+  }, [brainId]);
+
+  // The preference is a hard off switch: clear work that has not started and
+  // never enqueue a preview read while snippets are disabled. Tauri invokes
+  // already in flight cannot be cancelled, but their results are ignored.
+  useEffect(() => {
+    previewEnabledRef.current = showPreviewSnippets;
+    if (!showPreviewSnippets) {
+      const queued = previewQueueRef.current.splice(0);
+      for (const target of queued) {
+        previewPendingKeysRef.current.delete(previewTargetKey(target.scope, target.filename));
+      }
+      return;
+    }
+    pumpPreviewQueue();
+  }, [pumpPreviewQueue, showPreviewSnippets]);
+
+  useEffect(() => {
+    previewMountedRef.current = true;
+    return () => {
+      previewMountedRef.current = false;
+      previewQueueRef.current = [];
+      previewPendingKeysRef.current.clear();
+    };
+  }, []);
+
+  const requestVisiblePreviews = useCallback((filenames: string[]) => {
+    if (!showPreviewSnippets) return;
+
+    const wanted = new Set(filenames.map((filename) => previewTargetKey(scope, filename)));
+    // Drop queued work that has scrolled outside the virtualized overscan.
+    // Reads already in flight finish quietly; the Tauri command itself has no
+    // cancellation primitive.
+    previewQueueRef.current = previewQueueRef.current.filter((target) => {
+      const key = previewTargetKey(target.scope, target.filename);
+      if (wanted.has(key)) return true;
+      previewPendingKeysRef.current.delete(key);
+      return false;
+    });
+
+    const cached = previewsForScope(previewCacheRef.current, scope);
+    for (const filename of filenames) {
+      const key = previewTargetKey(scope, filename);
+      if (
+        Object.prototype.hasOwnProperty.call(cached, filename) ||
+        previewPendingKeysRef.current.has(key)
+      ) continue;
+      previewPendingKeysRef.current.add(key);
+      previewQueueRef.current.push({ scope, filename });
+    }
+    pumpPreviewQueue();
+  }, [pumpPreviewQueue, scope, showPreviewSnippets]);
+
+
+  // Keyboard: Ctrl+N
+  useEffect(() => {
+    if (triggerNewNote > 0) setIsCreating(true);
+  }, [triggerNewNote]);
+
+  // Keyboard: Ctrl+K
+  useEffect(() => {
+    if (triggerSearch > 0 && searchRef.current) searchRef.current.focus();
+  }, [triggerSearch]);
+
+  // Focus input when creating
+  useEffect(() => {
+    if (isCreating && inputRef.current) inputRef.current.focus();
+  }, [isCreating]);
+
+  // Full-text search via /api/recall when the server is up; local title
+  // substring match as a fallback when it's not. noteStore.setSearchQuery
+  // populates searchResults async, so a fresh keystroke may briefly
+  // filter by title before the server reply lands — intentional; avoids
+  // the sidebar going blank while we wait.
+  const searchResults = useNoteStore((s) => s.searchResults);
+  const filtered = (() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return notes;
+    if (searchResults.length > 0) {
+      const rank = new Map(searchResults.map((fn, i) => [fn, i]));
+      return notes
+        .filter((n) => rank.has(n.filename))
+        .sort((a, b) => (rank.get(a.filename)! - rank.get(b.filename)!));
+    }
+    // Local fallback: match title OR filename path substring. Adding
+    // filename lets users find notes by folder name too ("agent/…").
+    return notes.filter(
+      (n) =>
+        n.title.toLowerCase().includes(q) ||
+        n.filename.toLowerCase().includes(q),
+    );
+  })();
+
+  // Folder tree state — first path segment of filename groups notes.
+  // Notes with no slash in filename live at root (they render directly).
+  // Expanded state persists in localStorage so collapses survive reloads.
+  const [expanded, setExpanded] = useState<Record<string, boolean>>(() => {
+    try {
+      const raw = localStorage.getItem(scopedStorageKey("nv.folders.expanded", scope));
+      if (raw) return JSON.parse(raw);
+    } catch { /* corrupt */ }
+    return { agent: true, user: true };
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        scopedStorageKey("nv.folders.expanded", scope),
+        JSON.stringify(expanded),
+      );
+    }
+    catch { /* quota */ }
+  }, [expanded, scope]);
+  const toggleFolder = useCallback((name: string) => {
+    setExpanded((prev) => ({ ...prev, [name]: !prev[name] }));
+  }, []);
+
+  const handleCreate = useCallback(async () => {
+    const title = newTitle.trim();
+    if (!title) return;
+    await createNote(title);
+    setNewTitle("");
+    setIsCreating(false);
+  }, [newTitle, createNote]);
+
+  // Two-step delete with an in-app confirm dialog. The previous
+  // `window.confirm()` was too easy to dismiss by accident — a single
+  // Enter press through a native prompt, done. Now:
+  //   1. User clicks the delete icon on a row.
+  //   2. Styled modal opens, Cancel focused by default, destructive
+  //      action rendered in red on the right.
+  //   3. User has to explicitly click Delete (Esc / backdrop / Cancel
+  //      all dismiss safely).
+  const [pendingDelete, setPendingDelete] = useState<{ filename: string; title: string } | null>(null);
+  const handleDelete = useCallback(
+    (filename: string, title: string) => {
+      setPendingDelete({ filename, title });
+    },
+    []
+  );
+  const confirmDelete = useCallback(() => {
+    if (pendingDelete) {
+      deleteNoteAction(pendingDelete.filename);
+      setPendingDelete(null);
+    }
+  }, [pendingDelete, deleteNoteAction]);
+  const cancelDelete = useCallback(() => setPendingDelete(null), []);
+
+  // Right-click → floating context menu. State holds where on screen the
+  // menu should appear and which note triggered it. The menu component
+  // handles its own outside-click / Esc / scroll dismissal.
+  const [ctxMenu, setCtxMenu] = useState<{
+    x: number;
+    y: number;
+    note: NoteMeta;
+  } | null>(null);
+  const openContextMenu = useCallback((note: NoteMeta, x: number, y: number) => {
+    setCtxMenu({ x, y, note });
+  }, []);
+  const closeContextMenu = useCallback(() => setCtxMenu(null), []);
+
+  // Build menu items lazily so the closures capture the active note.
+  const ctxMenuItems: ContextMenuEntry[] = ctxMenu
+    ? [
+        {
+          label: "Open",
+          onSelect: () => selectNote(ctxMenu.note.filename),
+        },
+        {
+          label: "Rename…",
+          hint: "F2",
+          onSelect: () => setRenamingFilename(ctxMenu.note.filename),
+        },
+        {
+          label: "Reveal in vault",
+          onSelect: async () => {
+            try {
+              const { invoke } = await import("@tauri-apps/api/core");
+              const vaultPath = await invoke<string>("get_vault_path", { brainId });
+              const sep = vaultPath.includes("\\") ? "\\" : "/";
+              const full = `${vaultPath.replace(/[\\/]+$/, "")}${sep}${ctxMenu.note.filename}`;
+              await invoke("reveal_in_file_manager", { path: full });
+            } catch {
+              /* feature not available — silently no-op (web build, etc.) */
+            }
+          },
+        },
+        {
+          label: "Copy filename",
+          onSelect: async () => {
+            try {
+              await navigator.clipboard.writeText(ctxMenu.note.filename);
+            } catch { /* clipboard blocked */ }
+          },
+        },
+        { divider: true },
+        {
+          label: "Delete…",
+          destructive: true,
+          onSelect: () => handleDelete(ctxMenu.note.filename, ctxMenu.note.title),
+        },
+      ]
+    : [];
+
+  // Resizable sidebar width
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    try {
+      const saved = Number(localStorage.getItem(scopedStorageKey("nv.sidebar.width", scope)));
+      // 280px was the old fixed default, not an explicit density choice.
+      if (saved === 280) return DEFAULT_SIDEBAR_WIDTH;
+      if (Number.isFinite(saved) && saved >= MIN_SIDEBAR_WIDTH && saved <= MAX_SIDEBAR_WIDTH) return saved;
+    } catch { /* corrupt / private mode */ }
+    return DEFAULT_SIDEBAR_WIDTH;
+  });
+  const resizing = useRef(false);
+  const sidebarRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(scopedStorageKey("nv.sidebar.width", scope), String(sidebarWidth));
+    } catch { /* quota / private mode */ }
+  }, [scope, sidebarWidth]);
+
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => {
+      if (!resizing.current) return;
+      const sidebarLeft = sidebarRef.current?.getBoundingClientRect().left ?? 0;
+      const w = sidebarWidthFromPointer(e.clientX, sidebarLeft);
+      setSidebarWidth(w);
+    };
+    const onMouseUp = () => { resizing.current = false; document.body.style.cursor = ""; };
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => { window.removeEventListener("mousemove", onMouseMove); window.removeEventListener("mouseup", onMouseUp); };
+  }, []);
+
+  return (
+    <div
+      ref={sidebarRef}
+      className="nv-note-sidebar h-full flex flex-col backdrop-blur-[18px] relative"
+      style={{
+        width: sidebarWidth,
+        minWidth: sidebarWidth,
+        background: "color-mix(in srgb, var(--nv-surface) 90%, var(--nv-bg))",
+        borderRight: "1px solid var(--nv-border)",
+      }}
+    >
+      {/* Resize handle — 6px wide hit area with a persistent 2-dot drag
+           glyph so users can discover that the sidebar is resizable.
+           Dots sit at 35% opacity normally, fade up on hover; the strip
+           background tints into accent-glow on active drag. */}
+      <div
+        className="group absolute top-0 -right-[2px] w-[6px] h-full cursor-col-resize z-10 flex items-center justify-center"
+        onMouseDown={() => { resizing.current = true; document.body.style.cursor = "col-resize"; }}
+        title="Drag to resize sidebar"
+        aria-label="Resize sidebar"
+        role="separator"
+      >
+        {/* Strip tint: subtle on hover, stronger on active drag. Uses a
+            child div instead of styling the parent so the 6px hit area
+            doesn't visibly widen on hover (which would feel glitchy). */}
+        <div
+          className="absolute inset-y-0 left-1/2 -translate-x-1/2 w-px transition-all group-hover:w-[3px] group-active:w-[3px]"
+          style={{ background: "var(--nv-border)" }}
+        />
+        {/* Two-dot grip centered vertically. Stays visible at all zoom
+            levels so discoverability doesn't depend on hover. */}
+        <div className="relative flex flex-col gap-1 opacity-70 group-hover:opacity-100 group-active:opacity-100 transition-opacity">
+          <span
+            className="w-[3px] h-[3px] rounded-full"
+            style={{ background: "var(--nv-text-muted)" }}
+          />
+          <span
+            className="w-[3px] h-[3px] rounded-full"
+            style={{ background: "var(--nv-text-muted)" }}
+          />
+        </div>
+      </div>
+      {/* Header — search + new note on same line */}
+      <div className="px-3 pt-3 pb-2 flex-shrink-0">
+        <div className="flex items-center gap-2">
+          <div className="relative flex-1">
+            <input
+              ref={searchRef}
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Filter notes…"
+              className="w-full text-[13px] pl-8 pr-3 py-1.5 rounded-md focus:outline-none font-[Geist,sans-serif] transition-all"
+              style={{
+                background: "var(--nv-surface)",
+                color: "var(--nv-text)",
+                border: "1px solid var(--nv-border)",
+              }}
+            />
+            <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5" style={{ color: "var(--nv-text-dim)" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+            </svg>
+          </div>
+          <button
+            onClick={() => setIsCreating(true)}
+            className="nv-capture-action w-7 h-7 flex items-center justify-center rounded-md transition-all text-base leading-none flex-shrink-0"
+            style={{ border: "1px solid var(--nv-border)" }}
+            title="New note (Ctrl+N)"
+          >
+            +
+          </button>
+          <button
+            type="button"
+            onClick={() => onTrashOpen?.()}
+            className="w-7 h-7 flex items-center justify-center rounded-md transition-all flex-shrink-0 hover:[color:var(--nv-text)] hover:[background-color:var(--nv-surface-elevated,var(--nv-surface))]"
+            style={{ color: "var(--nv-text-muted)", border: "1px solid var(--nv-border)" }}
+            title="Trash"
+            aria-label="Open Trash"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M5 7h14M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5M14 11v5" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      {/* New note input (expands when creating) */}
+      {isCreating && (
+        <div className="px-4 pb-3 flex-shrink-0">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleCreate();
+            }}
+          >
+            <input
+              ref={inputRef}
+              value={newTitle}
+              onChange={(e) => setNewTitle(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  setIsCreating(false);
+                  setNewTitle("");
+                }
+              }}
+              onBlur={() => {
+                if (!newTitle.trim()) setIsCreating(false);
+              }}
+              placeholder="Note title..."
+              className="w-full text-[13px] px-3 py-2 rounded-md focus:outline-none font-[Geist,sans-serif]"
+              style={{ background: "var(--nv-surface)", color: "var(--nv-text)", border: "1px solid var(--nv-border)" }}
+              autoFocus
+            />
+          </form>
+        </div>
+      )}
+
+      {/* Note List — virtualized via @tanstack/react-virtual.
+           Row heights vary (with/without preview/strength bar), so we let
+           the virtualizer measure each row after first paint via
+           measureElement. The scroll container MUST have a fixed height
+           (flex-1 + min-h-0 provides that inside the flex column). */}
+      {notesStatus === "loading" && notes.length === 0 ? (
+        <div className="flex-1 flex items-center justify-center text-[12px]" style={{ color: "var(--nv-text-dim)" }}>
+          Loading notes…
+        </div>
+      ) : notesStatus === "error" && notes.length === 0 ? (
+        <div className="flex-1 flex flex-col items-center justify-center text-center px-5">
+          <p className="text-[13px] font-medium" style={{ color: "var(--nv-text)" }}>Notes couldn’t be loaded</p>
+          <p className="text-[11px] mt-1 line-clamp-3" style={{ color: "var(--nv-text-dim)" }}>{notesError ?? "Unknown error"}</p>
+          <button type="button" onClick={() => { void loadNotes(); }} className="mt-3 px-3 py-1.5 rounded-md text-[11px]" style={{ color: "var(--nv-text)", border: "1px solid var(--nv-border)" }}>Retry</button>
+        </div>
+      ) : (
+        <NoteList
+          rows={buildFolderRows(filtered, expanded)}
+          previews={previews}
+          showPreviewSnippets={showPreviewSnippets}
+          onVisibleNotesChange={requestVisiblePreviews}
+          activeFilename={activeFilename}
+          onSelect={(fn) => { void selectNote(fn); }}
+          onDelete={handleDelete}
+          onOpenContextMenu={openContextMenu}
+          onToggleFolder={toggleFolder}
+          renamingFilename={renamingFilename}
+          onStartRename={setRenamingFilename}
+          onCommitRename={async (oldFn, newFn) => {
+            if (newFn.trim() === oldFn || !newFn.trim()) {
+              setRenamingFilename(null);
+              return;
+            }
+            const ok = await renameNoteAction(oldFn, newFn.trim());
+            if (ok) setRenamingFilename(null);
+          }}
+          onDropToFolder={async (fromFilename, folder) => {
+            const slash = fromFilename.indexOf("/");
+            const leaf = slash >= 0 ? fromFilename.slice(slash + 1) : fromFilename;
+            const lastSlash = fromFilename.lastIndexOf("/");
+            const tailLeaf = lastSlash >= 0 ? fromFilename.slice(lastSlash + 1) : fromFilename;
+            const target = folder ? `${folder}/${tailLeaf}` : leaf.includes("/") ? tailLeaf : leaf;
+            if (target === fromFilename) return;
+            await renameNoteAction(fromFilename, target);
+          }}
+        />
+      )}
+
+      {notesStatus === "error" && notes.length > 0 && (
+        <button
+          type="button"
+          onClick={() => { void loadNotes(); }}
+          className="mx-3 mb-2 px-2 py-1.5 rounded-md text-left text-[11px]"
+          style={{ color: "var(--nv-negative)", border: "1px solid color-mix(in srgb, var(--nv-negative) 35%, transparent)" }}
+          title={notesError ?? undefined}
+        >
+          Couldn’t refresh notes · Retry
+        </button>
+      )}
+
+      {/* Empty states */}
+      {filtered.length === 0 && notes.length > 0 && (
+        <p className="text-[13px] text-center mt-12 font-[Geist,sans-serif]" style={{ color: "var(--nv-text-dim)" }}>
+          No results
+        </p>
+      )}
+      {notes.length === 0 && notesStatus === "ready" && (
+        <div className="mt-12 text-center px-4">
+          <p className="text-[13px] font-[Geist,sans-serif] mb-1" style={{ color: "var(--nv-text-muted)" }}>
+            No notes yet
+          </p>
+          <p className="text-[12px] font-[Geist,sans-serif]" style={{ color: "var(--nv-text-dim)" }}>
+            Press <kbd className="px-1 py-0.5 rounded text-[11px] font-mono" style={{ background: "var(--nv-surface)", color: "var(--nv-accent)" }}>⌘N</kbd> to start
+          </p>
+        </div>
+      )}
+
+      {/* Two-step delete safety gate — replaces the old
+          `window.confirm()`. Opened by clicking a row's delete icon;
+          closes on Esc / backdrop / Cancel. Only proceeds on explicit
+          click of the destructive-red button. */}
+      <ConfirmDialog
+        open={pendingDelete != null}
+        title="Delete this note?"
+        message={
+          pendingDelete
+            ? `"${pendingDelete.title}" will be moved to this vault's Trash. The Markdown file stays recoverable there, while its indexed memory is removed from search and the graph until you restore it.`
+            : ""
+        }
+        confirmLabel="Delete note"
+        cancelLabel="Keep it"
+        destructive={true}
+        onConfirm={confirmDelete}
+        onCancel={cancelDelete}
+      />
+
+      <ContextMenu
+        open={ctxMenu != null}
+        x={ctxMenu?.x ?? 0}
+        y={ctxMenu?.y ?? 0}
+        items={ctxMenuItems}
+        onClose={closeContextMenu}
+      />
+    </div>
+  );
+}
+
+// --- Inline rename input --------------------------------------------------
+
+/**
+ * Autofocused filename input used when a note row enters rename mode.
+ * The filename is a relative path (e.g. `agent/foo.md`); editing the
+ * path prefix effectively MOVES the note across folders — one primitive
+ * covers rename + move + manual folder creation.
+ */
+function RenameInput({
+  initial,
+  onCommit,
+  onCancel,
+}: {
+  initial: string;
+  onCommit: (next: string) => void;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState(initial);
+  const ref = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    ref.current?.focus();
+    // Select only the stem — not the folder prefix or the .md extension —
+    // so the common case (renaming inside the current folder) is one
+    // keystroke: start typing and the stem gets replaced.
+    const slash = initial.lastIndexOf("/");
+    const dot = initial.lastIndexOf(".md");
+    const from = slash + 1;
+    const to = dot > from ? dot : initial.length;
+    try { ref.current?.setSelectionRange(from, to); } catch { /* ignore */ }
+  }, [initial]);
+
+  // Why no onBlur commit:
+  //   The previous implementation committed on blur. That meant
+  //   clicking anywhere outside the input (including by accident)
+  //   silently saved a half-typed filename. Now blur is a no-op;
+  //   the user has to deliberately click ✓ or hit Enter to commit,
+  //   or click ✕ / press Escape to cancel.
+  const dirty = value.trim().length > 0 && value !== initial;
+
+  return (
+    <div
+      className="flex items-center gap-1 w-full"
+      onClick={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+    >
+      <input
+        ref={ref}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          e.stopPropagation();
+          if (e.key === "Enter" && dirty) onCommit(value);
+          else if (e.key === "Escape") onCancel();
+        }}
+        className="flex-1 min-w-0 text-[13px] px-2 py-1 rounded-md focus:outline-none font-mono"
+        style={{
+          background: "var(--nv-bg)",
+          color: "var(--nv-text)",
+          border: "1px solid var(--nv-accent)",
+        }}
+        placeholder="folder/name.md"
+      />
+      <button
+        onClick={() => dirty && onCommit(value)}
+        disabled={!dirty}
+        title="Confirm rename (Enter)"
+        aria-label="Confirm rename"
+        className="w-6 h-6 flex items-center justify-center rounded-md transition-colors disabled:opacity-40"
+        style={{
+          background: dirty ? "var(--nv-accent)" : "var(--nv-surface)",
+          color: dirty ? "var(--nv-bg)" : "var(--nv-text-muted)",
+          border: "1px solid var(--nv-border)",
+        }}
+      >
+        <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={3} strokeLinecap="round" strokeLinejoin="round">
+          <polyline points="20 6 9 17 4 12" />
+        </svg>
+      </button>
+      <button
+        onClick={onCancel}
+        title="Cancel rename (Esc)"
+        aria-label="Cancel rename"
+        className="w-6 h-6 flex items-center justify-center rounded-md transition-colors hover:[background-color:var(--nv-surface-elevated,var(--nv-surface))]"
+        style={{
+          background: "var(--nv-surface)",
+          color: "var(--nv-text-muted)",
+          border: "1px solid var(--nv-border)",
+        }}
+      >
+        <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18" />
+          <line x1="6" y1="6" x2="18" y2="18" />
+        </svg>
+      </button>
+    </div>
+  );
+}
+
+// --- Folder tree helpers --------------------------------------------------
+
+type Row =
+  | { kind: "folder"; name: string; count: number; expanded: boolean }
+  | { kind: "note"; note: NoteMeta; indent: number };
+
+/**
+ * Flatten notes into a renderable row list grouped by their top-level
+ * folder (first segment of `filename` before `/`). Folders come first in
+ * alphabetical order; root-level notes trail behind. Notes inside a
+ * folder only appear when the folder is expanded.
+ */
+function buildFolderRows(
+  notes: NoteMeta[],
+  expanded: Record<string, boolean>,
+): Row[] {
+  const byFolder: Record<string, NoteMeta[]> = {};
+  const rootNotes: NoteMeta[] = [];
+  for (const n of notes) {
+    const slash = n.filename.indexOf("/");
+    if (slash > 0) {
+      const folder = n.filename.slice(0, slash);
+      (byFolder[folder] ??= []).push(n);
+    } else {
+      rootNotes.push(n);
+    }
+  }
+  const rows: Row[] = [];
+  const folderNames = Object.keys(byFolder).sort((a, b) => a.localeCompare(b));
+  for (const name of folderNames) {
+    const isOpen = expanded[name] !== false;
+    rows.push({ kind: "folder", name, count: byFolder[name]!.length, expanded: isOpen });
+    if (isOpen) {
+      for (const n of byFolder[name]!) rows.push({ kind: "note", note: n, indent: 1 });
+    }
+  }
+  for (const n of rootNotes) rows.push({ kind: "note", note: n, indent: 0 });
+  return rows;
+}
+
+// --- Virtualized note list ------------------------------------------------
+
+interface NoteListProps {
+  rows: Row[];
+  previews: Record<string, string>;
+  showPreviewSnippets: boolean;
+  onVisibleNotesChange: (filenames: string[]) => void;
+  activeFilename: string | null;
+  onSelect: (filename: string) => void;
+  onDelete: (filename: string, title: string) => void;
+  onToggleFolder: (name: string) => void;
+  renamingFilename: string | null;
+  onStartRename: (filename: string | null) => void;
+  onCommitRename: (oldFilename: string, newFilename: string) => void;
+  onDropToFolder: (fromFilename: string, folder: string) => void;
+  onOpenContextMenu: (note: NoteMeta, x: number, y: number) => void;
+}
+
+/**
+ * Virtualized note-list scroller. Only renders rows currently in the
+ * viewport (+ overscan) regardless of total list size, so sidebars with
+ * thousands of notes stay as responsive as lists with ten.
+ *
+ * Rows have variable heights (preview lines wrap, strength bar optional)
+ * so we let `measureElement` take a real measurement on first paint and
+ * cache it by index. Selection by filename keeps row identity stable
+ * across filter changes so scroll position isn't reset.
+ */
+function NoteList({
+  rows,
+  previews,
+  showPreviewSnippets,
+  onVisibleNotesChange,
+  activeFilename,
+  onSelect,
+  onDelete,
+  onToggleFolder,
+  renamingFilename,
+  onStartRename,
+  onCommitRename,
+  onDropToFolder,
+  onOpenContextMenu,
+}: NoteListProps) {
+  // Track which folder is being dragged-over so we can highlight it.
+  // `__root__` is the sentinel for the top-of-list root drop zone.
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Category colour source — shared with the graph view so a folder
+  // reads the same hue in the tree and on the canvas.
+  const palette = useGraphSettingsStore((s) => s.palette);
+  const folderColors = useGraphSettingsStore((s) => s.folderColors);
+  const catColor = useCallback(
+    (folder: string) => folderColor(folder, palette, folderColors),
+    [palette, folderColors],
+  );
+
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: (i) => rows[i]?.kind === "folder"
+      ? 32
+      : showPreviewSnippets
+        ? ESTIMATED_ROW_HEIGHT
+        : ESTIMATED_ROW_HEIGHT_WITHOUT_PREVIEW,
+    overscan: VIRTUAL_OVERSCAN,
+    getItemKey: (i) => {
+      const r = rows[i];
+      if (!r) return i;
+      return r.kind === "folder" ? `folder:${r.name}` : `note:${r.note.filename}`;
+    },
+  });
+
+  const virtualItems = virtualizer.getVirtualItems();
+  const visibleNoteFilenames = useMemo(() => {
+    const filenames: string[] = [];
+    for (const item of virtualItems) {
+      const row = rows[item.index];
+      if (row?.kind === "note") filenames.push(row.note.filename);
+    }
+    return filenames;
+  }, [rows, virtualItems]);
+
+  useEffect(() => {
+    onVisibleNotesChange(visibleNoteFilenames);
+  }, [onVisibleNotesChange, visibleNoteFilenames]);
+
+  return (
+    <div
+      ref={scrollRef}
+      className="flex-1 overflow-y-auto min-h-0"
+      data-testid="sidebar-note-list"
+    >
+      <div
+        style={{
+          height: virtualizer.getTotalSize(),
+          width: "100%",
+          position: "relative",
+        }}
+      >
+        {virtualItems.map((virtualRow) => {
+          const row = rows[virtualRow.index];
+          if (!row) return null;
+
+          const positioning: React.CSSProperties = {
+            position: "absolute",
+            top: 0,
+            left: 0,
+            width: "100%",
+            transform: `translateY(${virtualRow.start}px)`,
+          };
+
+          if (row.kind === "folder") {
+            const isDropHover = dropTarget === row.name;
+            return (
+              <div
+                key={virtualRow.key}
+                data-index={virtualRow.index}
+                ref={virtualizer.measureElement}
+                style={positioning}
+                className="px-3 pt-1"
+                onDragOver={(e) => {
+                  // Only accept drops that carry our filename payload.
+                  // Prevent default to mark this as a valid drop target.
+                  if (e.dataTransfer.types.includes("application/nv-note")) {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
+                    if (dropTarget !== row.name) setDropTarget(row.name);
+                  }
+                }}
+                onDragLeave={() => {
+                  if (dropTarget === row.name) setDropTarget(null);
+                }}
+                onDrop={(e) => {
+                  const from = e.dataTransfer.getData("application/nv-note");
+                  setDropTarget(null);
+                  if (!from) return;
+                  e.preventDefault();
+                  onDropToFolder(from, row.name);
+                }}
+              >
+                <button
+                  onClick={() => onToggleFolder(row.name)}
+                  className="w-full flex items-center gap-2 rounded-md text-left transition-colors hover:[background-color:var(--nv-surface)]"
+                  style={{
+                    color: "var(--nv-text-muted)",
+                    background: isDropHover ? "var(--nv-accent-glow)" : undefined,
+                    outline: isDropHover ? `1px dashed var(--nv-accent)` : undefined,
+                    // Density-aware: tighter when compact, roomier when comfortable.
+                    paddingInline: "calc(var(--pad-x, 14px) * 0.65)",
+                    paddingBlock: "calc(var(--pad-y, 8px) * 0.5)",
+                  }}
+                >
+                  <svg
+                    className={`w-[11px] h-[11px] flex-shrink-0 transition-transform duration-150 ${row.expanded ? "rotate-90" : ""}`}
+                    fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                  </svg>
+                  <svg
+                    className="w-[13px] h-[13px] flex-shrink-0"
+                    fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}
+                    // Tint the folder icon with the category colour so the
+                    // tree and the graph agree on what each folder "is".
+                    style={{ color: catColor(row.name), opacity: 0.95 }}
+                  >
+                    {row.expanded ? (
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 9.776c.112-.017.227-.026.344-.026h15.812c.117 0 .232.009.344.026m-16.5 0a2.25 2.25 0 00-1.883 2.542l.857 6a2.25 2.25 0 002.227 1.932H19.05a2.25 2.25 0 002.227-1.932l.857-6a2.25 2.25 0 00-1.883-2.542m-16.5 0V6A2.25 2.25 0 016 3.75h3.879a1.5 1.5 0 011.06.44l2.122 2.12a1.5 1.5 0 001.06.44H18A2.25 2.25 0 0120.25 9v.776" />
+                    ) : (
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 12.75V12A2.25 2.25 0 014.5 9.75h15A2.25 2.25 0 0121.75 12v.75m-8.69-6.44l-2.12-2.12a1.5 1.5 0 00-1.061-.44H4.5A2.25 2.25 0 002.25 6v12a2.25 2.25 0 002.25 2.25h15A2.25 2.25 0 0021.75 18V9a2.25 2.25 0 00-2.25-2.25h-5.379a1.5 1.5 0 01-1.06-.44z" />
+                    )}
+                  </svg>
+                  <span className="text-[12px] font-[Geist,sans-serif] capitalize truncate">
+                    {row.name}
+                  </span>
+                  <span className="ml-auto text-[10px] font-[Geist,sans-serif] tabular-nums" style={{ color: "var(--nv-text-dim)" }}>
+                    {row.count}
+                  </span>
+                </button>
+              </div>
+            );
+          }
+
+          const note = row.note;
+          const isActive = activeFilename === note.filename;
+          const preview = previews[note.filename];
+          const isRenaming = renamingFilename === note.filename;
+
+          return (
+            <div
+              key={virtualRow.key}
+              data-index={virtualRow.index}
+              ref={virtualizer.measureElement}
+              onClick={() => !isRenaming && onSelect(note.filename)}
+              onContextMenu={(e) => {
+                if (isRenaming) return;
+                e.preventDefault();
+                onOpenContextMenu(note, e.clientX, e.clientY);
+              }}
+              draggable={!isRenaming}
+              onDragStart={(e) => {
+                // Custom MIME so only folder drop zones accept the drag —
+                // the browser won't interpret it as a file link drag.
+                e.dataTransfer.setData("application/nv-note", note.filename);
+                e.dataTransfer.effectAllowed = "move";
+              }}
+              style={positioning}
+              className="py-0.5"
+            >
+              <div
+                className={`group relative cursor-pointer rounded-lg transition-all duration-200 nv-spotlight${isActive ? " nv-spotlight-active" : ""}`}
+                style={{
+                  marginLeft: 12 + row.indent * 16,
+                  marginRight: 12,
+                  // Density-aware spacing — reads --pad-x/--pad-y set by
+                  // html[data-density] in index.css. Comfortable: 16/12;
+                  // cozy: 14/8; compact: 12/6. Default --pad-x is 16
+                  // which matches the prior hardcoded px-3.5 + py-3 feel.
+                  paddingInline: "var(--pad-x, 14px)",
+                  paddingBlock: "var(--pad-y, 12px)",
+                  minHeight: "var(--row-h, auto)",
+                  ...(isActive ? {
+                    background: "var(--nv-surface-elevated)",
+                    border: `1px solid color-mix(in srgb, var(--nv-accent) 22%, var(--nv-border))`,
+                    boxShadow: "0 5px 18px color-mix(in srgb, var(--nv-text) 7%, transparent)",
+                  } : {
+                    border: "1px solid transparent",
+                  }),
+                }}
+              >
+                {isRenaming ? (
+                  <RenameInput
+                    initial={note.filename}
+                    onCommit={(next) => onCommitRename(note.filename, next)}
+                    onCancel={() => onStartRename(null)}
+                  />
+                ) : (
+                  <>
+                    <div className="flex items-start justify-between gap-2">
+                      <h3
+                        className="text-[13.5px] font-semibold truncate font-[Geist,sans-serif] leading-snug tracking-[-0.005em] flex items-center gap-1.5 min-w-0"
+                        style={{ color: "var(--nv-text)" }}
+                      >
+                        {/* Category dot — same hue the note's folder gets in
+                            the graph, so the tree and canvas stay in sync. */}
+                        <span
+                          className="inline-block w-[7px] h-[7px] rounded-full flex-shrink-0"
+                          style={{ background: catColor(noteFolder(note.filename)) }}
+                          aria-hidden="true"
+                        />
+                        <span className="truncate">{note.title}</span>
+                      </h3>
+                      <span className="text-[10px] font-[Geist,sans-serif] whitespace-nowrap mt-0.5" style={{ color: "var(--nv-text-dim)" }}>
+                        {relativeTime(note.modified)}
+                      </span>
+                    </div>
+
+                    {showPreviewSnippets && preview && (
+                      <p className="text-[11.5px] mt-1.5 line-clamp-2 font-[Geist,sans-serif] leading-relaxed" style={{ color: "var(--nv-text-dim)" }}>
+                        {preview}
+                      </p>
+                    )}
+
+                    {/* Hover toolbar: rename + delete. Pencil opens the
+                        inline filename editor; × triggers handleDelete()
+                        which opens the centered ConfirmDialog (the only
+                        path that ever calls deleteNoteAction — verified
+                        no bypass paths exist). Right-click on the row
+                        offers the same actions via ContextMenu. */}
+                    <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-0.5">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onStartRename(note.filename); }}
+                        className="w-5 h-5 flex items-center justify-center rounded-md transition-colors [color:var(--nv-text-dim)] hover:[color:var(--nv-text)] hover:[background-color:var(--nv-surface)]"
+                        title="Rename (change name or move folder)"
+                        aria-label={`Rename ${note.title}`}
+                      >
+                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931zm0 0L19.5 7.125" />
+                        </svg>
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onDelete(note.filename, note.title); }}
+                        className="w-5 h-5 flex items-center justify-center rounded-md transition-colors text-xs [color:var(--nv-text-dim)] hover:[color:var(--nv-negative)] hover:[background-color:var(--nv-surface)]"
+                        title="Move to trash"
+                        aria-label={`Move ${note.title} to trash`}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+    </div>
+  );
+}

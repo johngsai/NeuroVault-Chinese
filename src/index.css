@@ -1,0 +1,617 @@
+@import "tailwindcss";
+
+/* NeuroVault Design System — quiet intelligence.
+ * Runtime variables come from settingsStore so every surface, including
+ * portals and CodeMirror, switches as one coherent palette. */
+:root {
+  --nv-font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "Segoe UI", system-ui, sans-serif;
+  --nv-font-reading: "New York", "Iowan Old Style", Charter, Georgia, serif;
+  --nv-font-mono: "SFMono-Regular", "JetBrains Mono", Consolas, monospace;
+  --nv-bg: #f7f6f2;
+  --nv-surface: #f0f2f5;
+  --nv-surface-2: #e7eaf0;
+  --nv-surface-elevated: #ffffff;
+  --nv-border: #d9dee6;
+  --nv-border-strong: #bfc7d3;
+  --nv-text: #171c25;
+  --nv-text-muted: #475365;
+  --nv-text-dim: #5e697b;
+  --nv-accent: #3457d5;
+  --nv-accent-glow: rgba(52, 87, 213, 0.10);
+  --nv-capture: #a84f2a;
+  --nv-capture-glow: rgba(168, 79, 42, 0.09);
+  --nv-on-accent: #ffffff;
+  --nv-positive: #17745f;
+  --nv-warning: #8b5a00;
+  --nv-negative: #b83b4b;
+  --nv-nav-bg: linear-gradient(165deg, #121720 0%, #0d121a 100%);
+  --nv-nav-surface: rgba(255, 255, 255, 0.055);
+  --nv-nav-border: rgba(255, 255, 255, 0.085);
+  --nv-nav-text: #f5f7fb;
+  --nv-nav-muted: #c1c7d2;
+  --nv-nav-dim: #8d96a5;
+  --nv-nav-active: linear-gradient(90deg, rgba(52, 87, 213, 0.18), rgba(168, 79, 42, 0.07));
+  --nv-shadow: 0 12px 32px rgba(21, 29, 41, 0.10);
+  --nv-overlay: rgba(13, 18, 26, 0.46);
+}
+
+@theme inline {
+  /* Tailwind compatibility aliases — never a separate palette. */
+  --color-bg: var(--nv-bg);
+  --color-surface: var(--nv-surface);
+  --color-surface-elevated: var(--nv-surface-elevated);
+  --color-border: var(--nv-border);
+  --color-border-strong: var(--nv-border-strong);
+  --color-raised: var(--nv-surface-elevated);
+  --color-brand: var(--nv-accent);
+  --color-brand-dim: var(--nv-accent-glow);
+  --color-capture: var(--nv-capture);
+  --color-teal: var(--nv-positive);
+  --color-purple: var(--nv-accent);
+  --color-coral: var(--nv-negative);
+  --color-green: var(--nv-positive);
+  --color-txt: var(--nv-text);
+  --color-sub: var(--nv-text-muted);
+  --color-tertiary: var(--nv-text-dim);
+  --color-muted: var(--nv-text-dim);
+  --color-faint: var(--nv-border-strong);
+
+  /* 4px spacing grid */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* Density tokens — overridden by [data-density] selectors below.
+     `--row-h` controls list-row height (sidebar notes, palette items, etc).
+     `--gap`  controls inter-element gap inside dense lists.
+     Defaults match the "comfortable" preset. */
+  --row-h: 36px;
+  --gap: 12px;
+  --pad-x: 16px;
+  --pad-y: 12px;
+
+  /* Typography scale */
+  --font-ui-small: 12px;
+  --font-ui: 13px;
+  --font-ui-medium: 14px;
+  --font-ui-large: 16px;
+  --font-body: 16px;            /* editor body — Obsidian standard */
+  --line-height-tight: 1.3;
+  --line-height-normal: 1.5;
+  --line-height-relaxed: 1.7;
+
+  /* Radii */
+  --radius-s: 4px;
+  --radius-m: 8px;
+  --radius-l: 12px;
+}
+
+/* Base */
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: var(--nv-bg);
+  color: var(--nv-text);
+  font-family: var(--nv-font-ui);
+  font-size: 13px;            /* UI default */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Older components used a Tailwind arbitrary `Geist` family without
+   shipping that font, which made the interface vary by machine. Route the
+   legacy class through the same deterministic native stack while those
+   components are progressively tokenized. */
+.font-\[Geist\,sans-serif\] {
+  font-family: var(--nv-font-ui) !important;
+}
+
+body {
+  overflow: hidden;
+}
+
+/* The reference is editorial rather than dashboard-like: a quiet serif
+   writing surface inside restrained system chrome. */
+.cm-editor {
+  font-family: var(--nv-font-reading);
+  font-size: 17px;
+  line-height: 1.72;
+  background: var(--nv-bg);
+}
+
+/* Cap editor content width to ~700px for readability — Obsidian's most loved feature */
+.cm-editor .cm-scroller {
+  display: flex;
+  justify-content: center;
+}
+.cm-editor .cm-content {
+  width: min(100%, 780px);
+  max-width: 780px;
+  min-height: 100%;
+  padding: 36px 46px 18vh;
+  font-family: var(--nv-font-reading);
+}
+
+.cm-editor .cm-line .tok-monospace,
+.cm-editor .cm-line code {
+  font-family: var(--nv-font-mono);
+  font-size: 0.875em;
+}
+
+/* Custom scrollbars — thin and unobtrusive */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--nv-text-dim) 40%, transparent);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--nv-text-muted) 56%, transparent);
+}
+
+/* Ordinary copy must keep working in a trust/evidence product. Only controls
+   opt out of selection; page copy, receipts, errors, and source text do not. */
+button, nav, [role="button"], [role="tab"] {
+  user-select: none;
+}
+
+.cm-editor, input, textarea, pre, code, [data-selectable="true"] {
+  user-select: text;
+}
+
+/* Smooth transitions everywhere */
+button, a, .transition {
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+@keyframes nv-toast-enter {
+  from { opacity: 0; transform: translateY(10px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.nv-toast-enter { animation: nv-toast-enter 160ms ease-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .nv-toast-enter { animation: none; }
+}
+
+/* Focus states — solid brand-blue ring meets WCAG AA against every surface tier.
+   The previous rgba(86,140,250,0.4) failed AA on --color-surface-elevated. */
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+button:focus-visible,
+a:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--nv-accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Density modes — applied to <html data-density="..."> by densityStore.
+   Components opt in by reading var(--row-h) / var(--gap). Existing fixed
+   sizing stays unchanged unless a component explicitly references these. */
+html[data-density="comfortable"] {
+  --row-h: 36px;
+  --gap: 12px;
+  --pad-x: 16px;
+  --pad-y: 12px;
+}
+html[data-density="cozy"] {
+  --row-h: 30px;
+  --gap: 8px;
+  --pad-x: 14px;
+  --pad-y: 8px;
+}
+html[data-density="compact"] {
+  --row-h: 24px;
+  --gap: 4px;
+  --pad-x: 12px;
+  --pad-y: 6px;
+}
+
+/* Animation: gentle fade in for modals */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.fade-in {
+  animation: fadeIn 150ms ease-out;
+}
+
+/* Reduce Motion — flipped on via the `.nv-reduce-motion` class on the
+   root <div>. Kills animations and transitions for users who enable
+   the setting, per WCAG 2.3.3. Keeps animations technically running
+   (some rely on end events) but shortens them to ~0. */
+.nv-reduce-motion *,
+.nv-reduce-motion *::before,
+.nv-reduce-motion *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+
+/* Respect the OS preference before app settings have hydrated, and in the
+   minitab / crash boundary where the app-level class may not be present. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Visually hidden, still exposed to assistive technology. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   Polish utilities — "Cortex Ink"
+   A small kit of classes that elevate chrome without touching tokens.
+   Usage: add `nv-spotlight` to any interactive row, `nv-glow` to any
+   accent element, etc.
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* Spotlight hover — mouse-tracked radial warmth.
+   Requires parent to set --mx / --my via onMouseMove (see Sidebar).
+   The radial follows the cursor for a "lit from within" feel. */
+.nv-spotlight {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+.nv-spotlight::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 180ms ease;
+  background: radial-gradient(
+    160px circle at var(--mx, 50%) var(--my, 50%),
+    color-mix(in srgb, var(--nv-accent) 10%, transparent),
+    transparent 55%
+  );
+  z-index: 0;
+}
+.nv-spotlight:hover::before { opacity: 1; }
+.nv-spotlight > * { position: relative; z-index: 1; }
+
+/* Active / selected variant — always-on spotlight for the current row */
+.nv-spotlight-active::before {
+  opacity: 1;
+  background: radial-gradient(
+    200px circle at 30% 50%,
+    color-mix(in srgb, var(--nv-accent) 14%, transparent),
+    transparent 60%
+  );
+}
+
+/* Semantic glows — for focus rings, pulsing indicators, and badges.
+   Use with `box-shadow: var(--nv-glow-peach)` or as a class. */
+:root {
+  --nv-glow-brand: 0 0 0 1px color-mix(in srgb, var(--nv-accent) 35%, transparent),
+                   0 0 18px -2px color-mix(in srgb, var(--nv-accent) 35%, transparent);
+  --nv-glow-teal:  0 0 0 1px color-mix(in srgb, var(--nv-positive) 35%, transparent),
+                   0 0 18px -2px color-mix(in srgb, var(--nv-positive) 35%, transparent);
+  --nv-glow-purple: 0 0 0 1px color-mix(in srgb, var(--nv-accent) 35%, transparent),
+                    0 0 18px -2px color-mix(in srgb, var(--nv-accent) 35%, transparent);
+  --nv-ring-brand: 0 0 0 2px color-mix(in srgb, var(--nv-accent) 18%, transparent);
+}
+.nv-glow-brand { box-shadow: var(--nv-glow-brand); }
+.nv-glow-teal  { box-shadow: var(--nv-glow-teal); }
+.nv-glow-purple { box-shadow: var(--nv-glow-purple); }
+
+/* Subtle noise texture overlay — prevents banding on large dark surfaces,
+   adds organic texture. Apply via `.nv-noise-bg` on any element; uses an
+   SVG data-URI so it works offline (Tauri). Opacity kept very low to
+   avoid visible grain — just enough to defeat 8-bit quantization. */
+.nv-noise-bg {
+  position: relative;
+}
+.nv-noise-bg::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.018;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix type='saturate' values='0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  background-size: 160px 160px;
+}
+
+/* Keyboard shortcut badge — for command palette rows + tooltips.
+   Tiny monospace pill that shows hotkeys inline. */
+.nv-kbd {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--color-tertiary);
+  background: var(--nv-surface-2);
+  border: 1px solid var(--color-border);
+  padding: 1px 5px;
+  border-radius: 4px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  min-height: 16px;
+}
+.nv-kbd-active {
+  color: var(--nv-accent);
+  border-color: color-mix(in srgb, var(--nv-accent) 35%, transparent);
+  background: var(--nv-accent-glow);
+}
+
+/* Fuzzy-match highlight — wrap matching chars in <mark class="nv-hl">. */
+.nv-hl {
+  color: var(--color-brand);
+  background: transparent;
+  font-weight: 600;
+}
+
+/* Tabular numbers for counts / timestamps / token displays */
+.nv-tabular { font-variant-numeric: tabular-nums; }
+
+/* ── Reference-inspired application shell ─────────────────────────────── */
+.nv-app-shell {
+  background:
+    radial-gradient(circle at 72% -10%, color-mix(in srgb, var(--nv-accent) 5%, transparent), transparent 34%),
+    var(--nv-bg);
+}
+
+.nv-app-frame {
+  min-height: 0;
+  background: var(--nv-bg);
+}
+
+.nv-workspace {
+  position: relative;
+  background: var(--nv-bg);
+}
+
+.nv-topbar {
+  min-height: 46px;
+  background: var(--nv-surface-elevated);
+  border-bottom: 1px solid var(--nv-border);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--nv-text) 2%, transparent);
+}
+
+.nv-topbar-button:hover {
+  background: var(--nv-surface-2) !important;
+  color: var(--nv-text) !important;
+}
+
+.nv-global-search-trigger {
+  width: clamp(180px, 24vw, 264px);
+  height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 0 10px;
+  border-radius: 9px;
+  color: var(--nv-text-dim);
+  background: color-mix(in srgb, var(--nv-surface) 68%, var(--nv-surface-elevated));
+  border: 1px solid var(--nv-border);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 30%, transparent);
+  text-align: left;
+}
+
+.nv-global-search-trigger:hover {
+  color: var(--nv-text);
+  background: var(--nv-surface);
+  border-color: var(--nv-border-strong);
+}
+
+.nv-global-search-trigger svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+
+.nv-global-search-label {
+  min-width: 0;
+  flex: 1;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.nv-global-search-trigger kbd {
+  min-width: 28px;
+  padding: 2px 5px;
+  border-radius: 5px;
+  color: var(--nv-text-dim);
+  background: var(--nv-surface-elevated);
+  border: 1px solid var(--nv-border);
+  font-family: var(--nv-font-ui);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.2;
+  text-align: center;
+}
+
+.nv-health-trigger:hover {
+  background: var(--nv-surface-2);
+}
+
+.nv-main-navigation {
+  position: relative;
+  isolation: isolate;
+  color: var(--nv-nav-text);
+  background: var(--nv-nav-bg);
+  border-right: 1px solid var(--nv-nav-border);
+  box-shadow: 10px 0 34px rgba(12, 23, 36, 0.10);
+}
+
+.nv-main-navigation::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 0%, color-mix(in srgb, var(--nv-accent) 13%, transparent), transparent 35%),
+    radial-gradient(circle at 86% 88%, color-mix(in srgb, var(--nv-capture) 7%, transparent), transparent 26%),
+    linear-gradient(180deg, transparent 55%, rgba(10, 22, 36, 0.16));
+}
+
+.nv-sidebar-brand {
+  min-height: 56px;
+}
+
+.nv-sidebar-mark {
+  filter: none;
+}
+
+.nv-sidebar-wordmark {
+  font-family: var(--nv-font-ui);
+  font-size: 15.5px;
+  font-weight: 650;
+  letter-spacing: -0.025em;
+  line-height: 1;
+}
+
+.nv-nav-item {
+  position: relative;
+}
+
+.nv-nav-item:hover {
+  color: var(--nv-nav-text) !important;
+  background: var(--nv-nav-surface) !important;
+}
+
+.nv-nav-item[aria-current="page"] {
+  color: var(--nv-nav-text) !important;
+  background: var(--nv-nav-active) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 7px 16px rgba(8, 18, 30, 0.10) !important;
+}
+
+/* A tiny synapse, not a fake data graph: recall flows cobalt-to-copper. */
+.nv-nav-item[aria-current="page"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--nv-accent), var(--nv-capture));
+  box-shadow: 0 0 9px var(--nv-accent-glow);
+}
+
+.nv-nav-item[aria-current="page"]::after {
+  content: "";
+  position: absolute;
+  left: -2px;
+  top: calc(50% - 2px);
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--nv-capture);
+}
+
+/* The navigation rail is dark in both appearances, so its focus indicator
+   must use the rail foreground rather than the canvas accent. */
+.nv-main-navigation :is(button, a, select, [tabindex]):focus-visible {
+  outline-color: var(--nv-nav-text);
+  box-shadow: 0 0 0 4px rgba(123, 145, 255, 0.34);
+}
+
+@media (max-width: 760px) {
+  .nv-global-search-trigger {
+    width: 32px;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .nv-global-search-label,
+  .nv-global-search-trigger kbd {
+    display: none;
+  }
+}
+
+.nv-note-sidebar {
+  background: color-mix(in srgb, var(--nv-surface) 90%, var(--nv-bg));
+  border-right: 1px solid var(--nv-border);
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+.nv-note-sidebar input,
+.nv-note-sidebar select {
+  background: var(--nv-surface-elevated) !important;
+  box-shadow: 0 1px 1px color-mix(in srgb, var(--nv-text) 4%, transparent);
+}
+
+.nv-editor-shell,
+.nv-editor-canvas {
+  background: var(--nv-bg);
+}
+
+.nv-editor-header {
+  min-height: 44px;
+  background: color-mix(in srgb, var(--nv-surface-elevated) 82%, transparent);
+  border-bottom: 1px solid var(--nv-border);
+}
+
+.nv-editor-tabs {
+  background: var(--nv-surface) !important;
+  border-bottom: 1px solid var(--nv-border);
+}
+
+.nv-card {
+  background: var(--nv-surface-elevated);
+  border: 1px solid var(--nv-border);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--nv-text) 4%, transparent);
+}
+
+.nv-floating-surface {
+  background: var(--nv-surface-elevated);
+  border: 1px solid var(--nv-border);
+  box-shadow: var(--nv-shadow);
+}
+
+.nv-search-field {
+  transition: border-color 140ms ease, box-shadow 140ms ease, background-color 140ms ease;
+}
+
+.nv-search-field:focus {
+  border-color: transparent !important;
+  box-shadow:
+    0 0 0 1px var(--nv-bg),
+    0 0 0 2px transparent,
+    0 -1px 0 var(--nv-capture),
+    0 1px 0 var(--nv-accent),
+    0 10px 28px color-mix(in srgb, var(--nv-accent) 10%, transparent) !important;
+}
+
+.nv-capture-action {
+  color: var(--nv-capture) !important;
+  background: var(--nv-capture-glow) !important;
+  border-color: color-mix(in srgb, var(--nv-capture) 42%, var(--nv-border)) !important;
+}
+
+@media (max-width: 1050px) {
+  .nv-topbar { min-height: 44px; }
+  .cm-editor .cm-content { padding: 30px 34px 14vh; }
+}

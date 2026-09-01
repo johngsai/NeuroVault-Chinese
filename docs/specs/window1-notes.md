@@ -1,0 +1,124 @@
+# Observation window 1 — review notes (NOT rule changes)
+
+> Process log for the 2026-07-11 → 2026-07-25 window. Batch-review
+> material only; the frozen criteria (stage3-admission.md) and the
+> consolidation rules are untouched until the window closes.
+
+## Wilson-bound arithmetic (verified 2026-07-11, prompted by Dath)
+
+The frozen bars require BOTH a raw untouched-approval rate AND a
+one-sided 95% Wilson lower confidence bound (z = 1.645):
+
+- memory_strengthened: raw ≥ 95% AND LCB ≥ 85%, n ≥ 20.
+  - 20/20 clean → LCB 93.7% → PASSES.
+  - 19/20 → raw exactly 95% but LCB 80.4% → FAILS.
+  - Effective meaning: 20 consecutive clean reviews, or materially
+    more reviews to absorb any failure.
+- With a TWO-sided 95% interval (z = 1.96), 20/20 → 83.9% (fails an
+  85% bar); reaching an LCB of 95% with zero failures needs ~73 clean
+  reviews. The doc's one-sided choice is intentional; never quote
+  "20 reviews" without the LCB context.
+
+## Rule-defect candidates for the window-end batch review
+
+1. working_state_refresh fires without checking that a working-state
+   note EXISTS for the relevant scope ("stale" implies existence).
+2. No real-activity bar: trivial/synthetic sessions (one prompt, no
+   outcomes) trigger the class.
+3. CROSS-SCOPE OBJECT MODEL: hooks do not send a room/project, so
+   every session journals into the ACTIVE brain and the class
+   implicates the brain-wide working-state buffer. A DreamBug session
+   proposing a refresh of ml-ai's shared state fails Dath's scoping
+   test ("would it update only DreamBug's state?"). No executor exists
+   for this class, so nothing can mis-apply today — but the class must
+   become scope-aware (session → project/room mapping) before any
+   Stage-3 consideration. Candidate fixes: hook sends repo/cwd-derived
+   room; proposals carry an explicit Scope; executor refuses scope
+   mismatches.
+4. Identical headlines are indistinguishable in a list; the project
+   name now renders in the card context row (addressed in the Memory
+   Review redesign).
+
+## Review-semantics reminders (from Dath, 2026-07-11)
+
+- Decisions label the OBSERVATION for observation-only classes and the
+  CHANGE for executable classes; the UI now uses two action models
+  ("Accurate / Not accurate" vs "Apply change / Reject").
+- Clicks do not cause online learning; analysis happens in aggregate
+  at the window boundary. Possible outcomes per class: removed,
+  improved, kept review-only, limited automatic execution, observed
+  for another window.
+- Do not reject a proposal for being about another project; reject it
+  if its evidence and its target scope disagree. Do not approve on
+  Claude's recommendation; approve on the evidence.
+
+## Pre-window labels excluded (2026-07-11)
+
+The three seed proposals were all approved at 14:18:31-32 — under the
+PREVIOUS UI wording ("Yes, that's right"), one second apart, an hour
+before the redesigned Memory Review was installed (15:18). Treatment:
+
+- Decisions are immutable by design; they stand in the store.
+- They PREDATE the window start and are EXCLUDED from window-1
+  analysis (filter: decided_at >= 2026-07-11T15:18Z). Window metrics
+  must apply this filter.
+- No data was affected (the class executes nothing).
+- Two of the three approvals contradict the scoping analysis recorded
+  above — consistent with exploration clicks under agreement-shaped
+  wording, and itself evidence for the action-model redesign.
+- The queue is now empty; window-1 labels begin with the next real
+  proposals under the "Accurate / Not accurate" wording.
+
+## Window conduct (final, from Dath 2026-07-11)
+
+- Work normally; do not manufacture scenarios.
+- Review on observation accuracy only; no verdict recommendations
+  from Claude on individual cards.
+- Record false negatives promptly — an EMPTY QUEUE is not
+  automatically good: it is either appropriate silence or insufficient
+  sensitivity, and only false-negative reporting distinguishes them.
+- Note annoyance, ambiguity, and review burden as they occur.
+- Change nothing mid-window except genuine safety, corruption,
+  scope-leak or usability failures.
+- At the boundary: FREEZE THE DATASET BEFORE inspecting aggregate
+  results; then evaluate coverage, per-class precision, edits,
+  rejection patterns, false negatives, held-out performance and
+  review burden against the precommitted criteria.
+
+## Window 1 closure — INCONCLUSIVE, no promotions (2026-07-31)
+
+Dataset frozen at the 2026-07-25 boundary and inspected per the conduct
+rule (freeze before results).
+
+**Result: zero usable in-window labels.** The only decisions in the store
+for these classes are the three pre-window seed approvals (2026-07-11
+14:18:31–32), which the `decided_at >= 2026-07-11T15:18Z` filter EXCLUDES.
+In-window n = 0 for every class.
+
+**Verdict — INCONCLUSIVE:**
+
+- No class reaches its frozen sample floor (memory_strengthened needs
+  n ≥ 20; see the Wilson-bound arithmetic above), so none can pass or fail
+  the admission bars. Nothing is admitted to Stage 3.
+- **No promotions.** Every class stays exactly where it was —
+  observation-only / review-only. No consolidation rule or executor
+  changes. Frozen criteria (`stage3-admission.md`) untouched.
+
+**Why the queue was empty is itself unresolved.** Per the conduct rule an
+empty queue is either appropriate silence or insufficient sensitivity, and
+only false-negative reporting distinguishes them — window 1 produced no
+false-negative reports either, so we cannot yet tell which it was. Working
+conclusion: the observation apparatus did not surface enough real proposals
+to evaluate; this is NOT evidence the classes are known-silent-correct.
+
+**Rule-defect candidates carry forward, unvalidated.** The four candidates
+above (working_state existence check, real-activity bar, the cross-scope
+object model, headline disambiguation) got no in-window evidence. They
+remain OPEN; the cross-scope/object model in particular is a prerequisite
+the Local Memory Curator work (session → project/room mapping) is expected
+to address.
+
+**Next:** open observation window 2 only after (a) the curator Phase A
+evidence/scope plumbing lands and (b) hooks send a repo/cwd-derived room so
+proposals carry an explicit Scope. Re-use the same frozen criteria; do not
+retune them to this null result.
