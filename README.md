@@ -33,6 +33,15 @@
 
 **Windows / Linux / Intel Mac** 暂无预编译包，请从源码构建（见下）。
 
+## 📖 使用说明
+
+1. **启动**：打开 NeuroVault，先创建/选择一个记忆库（Brain）。所有数据都在本地 `~/.neurovault/`，笔记就是普通 `.md` 文件，随时可导出或备份。
+2. **记录**：在「Memories」里直接写笔记，或让接入的 AI 帮你写；把文件拖进窗口可导入。
+3. **接入 AI（MCP，核心用法）**：App 内 **Settings → Connections** 一键配置 Claude Code / Claude Desktop / Cursor 等客户端，之后它们就能跨会话回忆你的记忆。
+4. **浏览与回忆**：「Today」看最近动态，「Graph」看记忆之间的关联图谱，搜索框检索历史记忆。
+
+> 完整图文教程见上游文档：[neurovault.dathproject.com/docs](https://neurovault.dathproject.com/docs)
+
 ## 🔧 从源码构建
 
 ```bash
